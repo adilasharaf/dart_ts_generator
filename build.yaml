@@ -1,50 +1,54 @@
-targets:
-  $default:
-    builders:
-      dart_ts_generator|dart_ts_file_builder:
-        enabled: true
-        generate_for:
-          include:
-            - lib/**/*.dart
-          exclude:
-            - lib/**/*.g.dart
-            - lib/**/*.freezed.dart
-        options:
-          output_dir: "lib/generated/ts"
-          file_suffix: ".g.ts"
-          date_time_as_string: true
-          include_base_classes: true
-
-      dart_ts_generator|dart_ts_index_builder:
-        enabled: true
-        generate_for:
-          include:
-            - lib/**/*.dart
-          exclude:
-            - lib/**/*.g.dart
-            - lib/**/*.freezed.dart
-        options:
-          output_dir: "lib/generated/ts"
-          index_file: "index.ts"
+# build.yaml
+#
+# dart_ts_generator — builder declarations.
+#
+# Consumer projects do NOT need a build.yaml; builders apply automatically
+# via `auto_apply: dependents`.
+#
+# Consumers CAN add a build.yaml to tune options:
+#
+#   targets:
+#     $default:
+#       builders:
+#         dart_ts_generator|dart_ts_file_builder:
+#           options:
+#             date_time_as_string: false
+#         dart_ts_generator|dart_ts_index_builder:
+#           options:
+#             barrel_file: lib/gen/eimodels.g.ts   # default, change if needed
 
 builders:
+
+  # ── Primary builder ──────────────────────────────────────────────────────
+  # Per-file: lib/src/Foo.dart → lib/gen/src/Foo.g.ts
+  #
+  # Uses capture-group syntax so build_runner pre-approves each output path:
+  #   ^lib/{{}}.dart  matches lib/src/Vehicle.dart  (capture: src/Vehicle)
+  #   lib/gen/{{}}.g.ts resolves to lib/gen/src/Vehicle.g.ts
   dart_ts_file_builder:
     import: "package:dart_ts_generator/builder.dart"
     builder_factories: ["dartTsFileBuilder"]
     build_extensions:
-      ".dart": [".g.ts"]
+      "^lib/{{}}.dart": ["lib/gen/{{}}.g.ts"]
     auto_apply: dependents
     build_to: source
-    runs_before: []
-    required_inputs: []
-    applies_builders: []
+    defaults:
+      generate_for:
+        include:
+          - lib/**/*.dart
+        exclude:
+          - lib/**/*.g.dart
+          - lib/**/*.freezed.dart
+          - lib/gen/**
 
+  # ── Barrel builder ───────────────────────────────────────────────────────
+  # Runs once per package; writes lib/gen/eimodels.g.ts that re-exports all
+  # per-file .g.ts outputs as a single entry point for consumers.
   dart_ts_index_builder:
     import: "package:dart_ts_generator/index_builder.dart"
     builder_factories: ["tsIndexBuilder"]
     build_extensions:
-      "$lib$": ["lib/generated/ts/index.ts"]
+      "$lib$": ["gen/eimodels.g.ts"]
     auto_apply: dependents
     build_to: source
-    runs_before: []
     is_optional: true

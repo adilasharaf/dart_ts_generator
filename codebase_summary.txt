@@ -20,50 +20,180 @@
   code_summary
   README.md
   test
-  bin
 
 --- FILE CONTENTS ---
 
 FILE: ./lib/builder.dart
+// lib/builder.dart
+//
+// ── Output layout ─────────────────────────────────────────────────────────────
+//
+//   lib/src/Vehicle.dart           →  lib/gen/src/Vehicle.g.ts
+//   lib/src/enums/DLStatus.dart    →  lib/gen/src/enums/DLStatus.g.ts
+//   lib/src/config/AppConfig.dart  →  lib/gen/src/config/AppConfig.g.ts
+//
+// TSC then compiles lib/gen/**/*.g.ts  →  dist/
+// package.json points at dist/ for npm / git-dependency consumers.
+//
+// ── Why the capture-group pattern ────────────────────────────────────────────
+// build_runner validates every AssetId written against the set derived from
+// buildExtensions BEFORE build() runs.  A simple ".dart" → ".g.ts" map only
+// allows writing alongside the source file (lib/src/Foo.g.ts).
+//
+// The `^lib/{{}}.dart` → `lib/gen/{{}}.g.ts` pattern uses build_runner's
+// capture-group syntax:
+//   • `^`    – match the full asset path (not just a suffix).
+//   • `{{}}` – capture group that expands to everything between lib/ and .dart,
+//              e.g. "src/enums/DLStatus" for lib/src/enums/DLStatus.dart.
+//
+// This tells build_runner the exact output path for each input up-front, so
+// writing lib/gen/src/enums/DLStatus.g.ts is pre-approved — no
+// UnexpectedOutputException.
+//
+// We use `buildStep.allowedOutputs.single` to retrieve the pre-computed output
+// AssetId rather than constructing it manually.
+//
+// ── analyzer ^10 API notes ────────────────────────────────────────────────────
+//   • library.classes / library.enums  (replaces topLevelElements)
+//   • library.firstFragment.source.uri (replaces library.source.uri)
+//   • FieldElement.isOriginDeclaration (replaces isSynthetic)
+
+import 'dart:async';
+
+import 'package:analyzer/dart/element/element.dart';
 import 'package:build/build.dart';
-import 'package:source_gen/source_gen.dart';
-import 'generator.dart';
+import 'package:glob/glob.dart';
 
-/// Builder factory called by build_runner.
-Builder dartTsGeneratorBuilder(BuilderOptions options) {
-  return SharedPartBuilder(
-    [DartTsGenerator(options.config)],
-    'dart_ts_generator',
-  );
-}
+import 'src/cross_file_registry.dart';
+import 'src/model_analyzer.dart';
+import 'src/zod_generator.dart';
 
-/// Standalone file-per-file builder (alternative mode).
-Builder dartTsFileBuilder(BuilderOptions options) {
-  return _TsFileBuilder(options.config);
-}
+// ── Factory functions ────────────────────────────────────────────────────────
+
+Builder dartTsFileBuilder(BuilderOptions options) => _TsFileBuilder(options);
+Builder dartTsGeneratorBuilder(BuilderOptions options) =>
+    _TsFileBuilder(options);
+
+// ── Builder ──────────────────────────────────────────────────────────────────
 
 class _TsFileBuilder implements Builder {
-  final Map<String, dynamic> config;
+  final BuilderOptions _options;
 
-  _TsFileBuilder(this.config);
+  _TsFileBuilder(this._options);
 
+  /// Capture-group mapping (resolved by build_runner before build() is called):
+  ///
+  ///   lib/src/Vehicle.dart           →  lib/gen/src/Vehicle.g.ts
+  ///   lib/src/enums/DLStatus.dart    →  lib/gen/src/enums/DLStatus.g.ts
   @override
-  Map<String, List<String>> get buildExtensions => {
-        '.dart': ['.g.ts'],
-      };
+  Map<String, List<String>> get buildExtensions => const {
+    r'^lib/{{}}.dart': ['lib/gen/{{}}.g.ts'],
+  };
 
   @override
   Future<void> build(BuildStep buildStep) async {
     final inputId = buildStep.inputId;
-    final library = await buildStep.inputLibrary;
 
-    final generator = DartTsGenerator(config);
-    final output = await generator.generateForLibrary(library, buildStep);
+    // ── Guards ────────────────────────────────────────────────────────────
+    if (inputId.path.endsWith('.g.dart')) return;
+    if (inputId.path.endsWith('.freezed.dart')) return;
+    if (!await buildStep.canRead(inputId)) return;
 
-    if (output == null || output.trim().isEmpty) return;
+    // ── Pre-scan (once per build session) ─────────────────────────────────
+    final registry = CrossFileRegistry.instance;
+    if (!registry.isInitialized) {
+      registry.reset();
+      await _preScan(buildStep, registry);
+      registry.markInitialized();
+    }
 
-    final outputId = inputId.changeExtension('.g.ts');
-    await buildStep.writeAsString(outputId, output);
+    // ── Resolve library ───────────────────────────────────────────────────
+    LibraryElement library;
+    try {
+      library = await buildStep.inputLibrary;
+    } catch (_) {
+      return;
+    }
+
+    // Skip part files: a part's firstFragment points to the parent library.
+    final fragmentUri = library.firstFragment.source.uri.toString();
+    final inputUri = inputId.uri.toString();
+    if (!fragmentUri.endsWith(inputId.path) && fragmentUri != inputUri) {
+      return;
+    }
+
+    // ── Generate ──────────────────────────────────────────────────────────
+    final dateTimeAsString =
+        _options.config['date_time_as_string'] as bool? ?? true;
+
+    final analyzer = ModelAnalyzer(registry);
+    final zodGen = ZodGenerator(registry, dateTimeAsString: dateTimeAsString);
+
+    final allClasses = analyzer.analyzeLibrary(library, inputId.path);
+    final relevant = allClasses
+        .where((c) => c.isEnum || c.hasJsonSerializable)
+        .toList();
+
+    if (relevant.isEmpty) return;
+
+    final tsSource = zodGen.generateFile(relevant, inputId.path);
+    if (tsSource.trim().isEmpty) return;
+
+    // allowedOutputs.single is the AssetId build_runner pre-computed from the
+    // capture-group pattern — use it instead of constructing the path manually.
+    final outputId = buildStep.allowedOutputs.single;
+    await buildStep.writeAsString(outputId, tsSource);
+  }
+
+  // ── Pre-scan ──────────────────────────────────────────────────────────────
+
+  Future<void> _preScan(BuildStep buildStep, CrossFileRegistry registry) async {
+    final assets = await buildStep.findAssets(Glob('lib/**.dart')).toList();
+
+    await Future.wait(
+      assets.map((asset) async {
+        if (asset.path.endsWith('.g.dart')) return;
+        if (asset.path.endsWith('.freezed.dart')) return;
+
+        LibraryElement lib;
+        try {
+          lib = await buildStep.resolver.libraryFor(asset);
+        } catch (_) {
+          return;
+        }
+
+        for (final e in lib.enums) {
+          final values = e.fields
+              .where((f) => f.isEnumConstant)
+              .map((f) => f.name)
+              .toList();
+          registry.register(
+            TypeInfo(
+              name: e.name!,
+              isEnum: true,
+              enumValues: values.whereType<String>().toList(),
+              sourceAssetPath: asset.path,
+            ),
+          );
+        }
+
+        for (final c in lib.classes) {
+          final superType = c.supertype;
+          final superName =
+              (superType != null && superType.element.name != 'Object')
+              ? superType.element.name
+              : null;
+          registry.register(
+            TypeInfo(
+              name: c.name!,
+              isEnum: false,
+              sourceAssetPath: asset.path,
+              superclassName: superName,
+            ),
+          );
+        }
+      }),
+    );
   }
 }
 
@@ -85,140 +215,50 @@ export 'generator.dart';
 --- END FILE ---
 
 FILE: ./lib/generator.dart
-import 'dart:async';
+// lib/src/generator.dart
+//
+// Core generation logic. Orchestrates ModelAnalyzer → ZodGenerator.
+// Does NOT extend source_gen's Generator to avoid part-file conflicts.
 
 import 'package:analyzer/dart/element/element.dart';
 import 'package:build/build.dart';
-import 'package:path/path.dart' as p;
-import 'package:source_gen/source_gen.dart';
+import 'package:dart_ts_generator/dart_ts_generator.dart';
 
-import 'src/model_analyzer.dart';
-import 'src/zod_generator.dart';
+class TsZodGenerator {
+  final BuilderOptions options;
+  final CrossFileRegistry _registry;
+  late final ModelAnalyzer _analyzer;
+  late final ZodGenerator _zodGen;
 
-class DartTsGenerator extends Generator {
-  final Map<String, dynamic> config;
-
-  DartTsGenerator(this.config);
-
-  final _jsonSerializableChecker = TypeChecker.typeNamedLiterally(
-    'JsonSerializable',
-    inPackage: 'json_annotation',
-  );
-
-  final _tsGenerateChecker = TypeChecker.typeNamedLiterally(
-    'TsGenerate',
-    inPackage: 'dart_ts_generator',
-  );
-
-  @override
-  FutureOr<String?> generate(LibraryReader library, BuildStep buildStep) async {
-    final tsContent = await generateForLibrary(library.element, buildStep);
-    if (tsContent == null || tsContent.trim().isEmpty) return null;
-
-    // ── KEY FIX 1: Write the .g.ts file directly, bypassing source_gen's
-    //   Dart formatter entirely. We construct the output AssetId manually
-    //   so we control both the extension AND the output directory.
-    final outputDir = config['output_dir'] as String? ?? 'lib/generated/ts';
-
-    // e.g. lib/models/ei_user.dart → ei_user
-    final baseName = p.basenameWithoutExtension(buildStep.inputId.path);
-
-    final outputId = AssetId(
-      buildStep.inputId.package,
-      '$outputDir/$baseName.g.ts', // e.g. lib/generated/ts/ei_user.g.ts
-    );
-
-    await buildStep.writeAsString(outputId, tsContent);
-
-    // ── KEY FIX 2: Return null so source_gen does NOT try to write or
-    //   format anything itself. If we returned a string here, source_gen
-    //   would pipe it through `dart format` and write a .g.dart part —
-    //   both of which are wrong for TypeScript output.
-    return null;
+  TsZodGenerator(this.options, this._registry) {
+    final dateTimeAsString =
+        options.config['date_time_as_string'] as bool? ?? true;
+    _analyzer = ModelAnalyzer(_registry);
+    _zodGen = ZodGenerator(_registry, dateTimeAsString: dateTimeAsString);
   }
 
-  Future<String?> generateForLibrary(
+  /// Entry point called by the builder for each input asset.
+  ///
+  /// Returns the generated TypeScript source, or empty string to skip.
+  Future<String> generate(
     LibraryElement library,
+    AssetId inputId,
     BuildStep buildStep,
   ) async {
-    final generatorConfig = GeneratorConfig.fromMap(config);
+    final assetPath = inputId.path; // e.g. "lib/src/Vehicle.dart"
 
-    final allClasses = _collectClasses(library);
-    if (allClasses.isEmpty) return null;
+    // Analyze the library
+    final classes = _analyzer.analyzeLibrary(library, assetPath);
 
-    final knownModelNames = allClasses.map((c) => c.name!).toSet();
-    final knownEnumNames = allClasses
-        .whereType<EnumElement>()
-        .map((c) => c.name!)
-        .toSet();
+    if (classes.isEmpty) return '';
 
-    final analyzer = ModelAnalyzer(
-      knownModelNames: knownModelNames,
-      knownEnumNames: knownEnumNames,
-    );
+    // Filter: only emit output for classes that are @JsonSerializable
+    // or enums — skip pure utility files
+    final relevant =
+        classes.where((c) => c.isEnum || c.hasJsonSerializable).toList();
+    if (relevant.isEmpty) return '';
 
-    final classInfos = <ClassInfo>[];
-    for (final cls in allClasses) {
-      try {
-        if (cls is EnumElement) {
-          classInfos.add(_analyzeEnum(cls));
-        } else if (cls is ClassElement) {
-          if (!_shouldGenerate(cls)) continue;
-          classInfos.add(analyzer.analyzeClass(cls));
-        }
-      } catch (e) {
-        log.warning('dart_ts_generator: failed to analyze ${cls.name}: $e');
-      }
-    }
-
-    if (classInfos.isEmpty) return null;
-
-    final registry = {for (final c in classInfos) c.name!: c};
-
-    final zodGen = ZodSchemaGenerator(
-      classRegistry: registry,
-      config: generatorConfig,
-    );
-
-    return zodGen.generateFile(classInfos);
-  }
-
-  List<InterfaceElement> _collectClasses(LibraryElement library) {
-    final result = <InterfaceElement>[];
-    for (final element in library.children) {
-      if (element is EnumElement) result.add(element);
-      if (element is ClassElement) result.add(element);
-      if (element is MixinElement) result.add(element);
-    }
-    return result;
-  }
-
-  bool _shouldGenerate(ClassElement cls) {
-    if (cls.name!.startsWith('_')) return false;
-    if (_jsonSerializableChecker.hasAnnotationOf(cls)) return true;
-    if (_tsGenerateChecker.hasAnnotationOf(cls)) return true;
-    final superName = cls.supertype?.element.name;
-    if (superName != null &&
-        superName != 'Object' &&
-        !superName.startsWith('_')) {
-      return true;
-    }
-    return false;
-  }
-
-  ClassInfo _analyzeEnum(EnumElement element) {
-    final values = element.fields
-        .where((f) => f.isEnumConstant)
-        .map((f) => f.name)
-        .toList();
-
-    return ClassInfo(
-      name: element.name,
-      fields: [],
-      isEnum: true,
-      enumValues: values,
-      isAbstract: false,
-    );
+    return _zodGen.generateFile(relevant, assetPath);
   }
 }
 
@@ -259,835 +299,711 @@ class TsFirestoreModel {
 --- END FILE ---
 
 FILE: ./lib/src/cross_file_registry.dart
-/// Tracks which schemas are defined in which files so the generator
-/// can emit correct `import` statements when referencing cross-file types.
-///
-/// Example:
-///   EiModel is defined in ei_model.dart → generates ei_model.g.ts
-///   EiUser extends EiModel (in ei_user.dart) → needs:
-///     import { EiModelSchema } from './ei_model.g';
-library;
+// lib/src/cross_file_registry.dart
+//
+// Global registry that maps every Dart type name discovered across all
+// scanned source files to its metadata.
+//
+// ── Import path calculation ───────────────────────────────────────────────────
+// Generated files live at  lib/gen/**/*.g.ts  (not alongside the source).
+// Cross-file imports inside .g.ts files must therefore be relative to
+// lib/gen/, not lib/.
+//
+//   Source:  lib/src/Vehicle.dart        → output: lib/gen/src/Vehicle.g.ts
+//   Source:  lib/src/enums/DLStatus.dart → output: lib/gen/src/enums/DLStatus.g.ts
+//
+//   Import from Vehicle.g.ts → DLStatus.g.ts:
+//     ../enums/DLStatus          (relative from lib/gen/src/ to lib/gen/src/enums/)
 
 import 'package:path/path.dart' as p;
 
-/// Holds a registry of [typeName → sourceFile] mappings accumulated
-/// across an entire build run.
+// ── Data model ──────────────────────────────────────────────────────────────
+
+class TypeInfo {
+  final String name;
+  final bool isEnum;
+  final List<String> enumValues;
+
+  /// Package-relative asset path of the *source* dart file,
+  /// e.g. "lib/src/enums/DLStatus.dart".
+  final String sourceAssetPath;
+
+  final String? superclassName;
+
+  const TypeInfo({
+    required this.name,
+    required this.isEnum,
+    this.enumValues = const [],
+    required this.sourceAssetPath,
+    this.superclassName,
+  });
+}
+
+// ── Registry ────────────────────────────────────────────────────────────────
+
 class CrossFileRegistry {
-  /// Map from class/enum name → the .g.ts file path (relative to output root)
-  final Map<String, String> _typeToFile = {};
+  CrossFileRegistry._();
+  static final CrossFileRegistry instance = CrossFileRegistry._();
 
-  /// Map from .g.ts file → list of type names defined there
-  final Map<String, List<String>> _fileToTypes = {};
+  final Map<String, TypeInfo> _types = {};
+  bool _initialized = false;
 
-  void registerTypes(String outputFilePath, List<String> typeNames) {
-    for (final name in typeNames) {
-      _typeToFile[name] = outputFilePath;
-    }
-    _fileToTypes[outputFilePath] = typeNames;
+  bool get isInitialized => _initialized;
+  void markInitialized() => _initialized = true;
+
+  void reset() {
+    _types.clear();
+    _initialized = false;
   }
 
-  /// Returns the output file path where [typeName] is defined,
-  /// or null if it's defined in the same file (no import needed).
-  String? fileForType(String typeName) => _typeToFile[typeName];
+  void register(TypeInfo info) => _types[info.name] = info;
 
-  /// Given the current file and a referenced type, return the relative
-  /// import path (without extension), or null if same-file.
-  String? importPathFor(String currentFile, String referencedType) {
-    final targetFile = _typeToFile[referencedType];
-    if (targetFile == null || targetFile == currentFile) return null;
+  TypeInfo? resolve(String typeName) => _types[typeName];
+  bool isEnum(String typeName) => _types[typeName]?.isEnum ?? false;
+  List<String> enumValues(String typeName) =>
+      _types[typeName]?.enumValues ?? const [];
+  String? sourceOf(String typeName) => _types[typeName]?.sourceAssetPath;
+  String? superclassOf(String typeName) => _types[typeName]?.superclassName;
+  Iterable<String> get allTypeNames => _types.keys;
 
-    final currentDir = p.dirname(currentFile);
-    var rel = p.relative(targetFile, from: currentDir);
+  // ── Import resolution ─────────────────────────────────────────────────────
 
-    // Remove .ts extension for TS imports
-    if (rel.endsWith('.ts')) {
-      rel = rel.substring(0, rel.length - 3);
+  /// Compute the relative TypeScript import path from the *generated* file
+  /// that is being written ([fromSourceAssetPath]) to the *generated* file
+  /// that defines [typeName].
+  ///
+  /// Both arguments are **source** asset paths (e.g. "lib/src/Vehicle.dart").
+  /// We convert them to their output paths under lib/gen/ before computing
+  /// the relative path.
+  ///
+  /// Returns null if [typeName] is unknown or defined in the same source file.
+  String? relativeImportFor({
+    required String typeName,
+    required String fromSourceAssetPath,
+  }) {
+    final toSourcePath = sourceOf(typeName);
+    if (toSourcePath == null || toSourcePath == fromSourceAssetPath) {
+      return null;
     }
 
-    // Ensure ./ prefix
+    // Convert source paths → lib/gen/ output paths.
+    final fromGenTs = _sourceToGenTsPath(fromSourceAssetPath);
+    final toGenTs = _sourceToGenTsPath(toSourcePath);
+
+    final fromDir = p.posix.dirname(fromGenTs);
+    var rel = p.posix.relative(toGenTs, from: fromDir);
+
     if (!rel.startsWith('.')) rel = './$rel';
+
+    // Strip .ts extension (TypeScript import convention).
+    if (rel.endsWith('.ts')) rel = rel.substring(0, rel.length - 3);
 
     return rel;
   }
 
-  bool hasType(String name) => _typeToFile.containsKey(name);
-}
+  // ── Helpers ───────────────────────────────────────────────────────────────
 
-/// Generates an `index.ts` barrel file that re-exports all generated schemas.
-class IndexBarrelGenerator {
-  static String generate(List<String> outputFiles, String indexFilePath) {
-    final buf = StringBuffer();
-    buf.writeln('// AUTO-GENERATED by dart_ts_generator. DO NOT EDIT.');
-    buf.writeln('// Barrel re-export of all generated schemas.');
-    buf.writeln();
+  /// Maps a source asset path to its generated output path under lib/gen/.
+  ///
+  ///   lib/src/Vehicle.dart        →  lib/gen/src/Vehicle.g.ts
+  ///   lib/src/enums/DLStatus.dart →  lib/gen/src/enums/DLStatus.g.ts
+  String _sourceToGenTsPath(String sourcePath) {
+    // Strip leading lib/
+    final withoutLib = sourcePath.startsWith('lib/')
+        ? sourcePath.substring('lib/'.length)
+        : sourcePath;
 
-    final indexDir = p.dirname(indexFilePath);
+    // Replace .dart with .g.ts
+    final withoutDart = withoutLib.endsWith('.dart')
+        ? withoutLib.substring(0, withoutLib.length - '.dart'.length)
+        : withoutLib;
 
-    for (final file in outputFiles) {
-      var rel = p.relative(file, from: indexDir);
-      if (rel.endsWith('.ts')) rel = rel.substring(0, rel.length - 3);
-      if (!rel.startsWith('.')) rel = './$rel';
-      buf.writeln("export * from '$rel';");
-    }
-
-    return buf.toString();
-  }
-}
-
-/// Generates cross-file import headers for a single output file.
-class ImportHeaderGenerator {
-  static String generate({
-    required String currentFile,
-    required List<String> referencedTypes,
-    required CrossFileRegistry registry,
-    required String zodImport,
-  }) {
-    final buf = StringBuffer();
-    buf.writeln("import { z } from '$zodImport';");
-
-    // Group referenced types by their source file
-    final importMap = <String, List<String>>{};
-
-    for (final type in referencedTypes) {
-      final importPath = registry.importPathFor(currentFile, type);
-      if (importPath != null) {
-        importMap.putIfAbsent(importPath, () => []).add('${type}Schema');
-      }
-    }
-
-    for (final entry in importMap.entries.toList()..sort((a, b) => a.key.compareTo(b.key))) {
-      final symbols = entry.value.join(', ');
-      buf.writeln("import { $symbols } from '${entry.key}';");
-    }
-
-    return buf.toString();
+    return 'lib/gen/$withoutDart.g.ts';
   }
 }
 
 --- END FILE ---
 
 FILE: ./lib/src/model_analyzer.dart
-import 'package:analyzer/dart/element/element.dart';
-import 'package:analyzer/dart/element/type.dart';
-import 'package:analyzer/dart/element/nullability_suffix.dart';
-import 'package:analyzer/dart/constant/value.dart';
-import 'package:dart_ts_generator/dart_ts_generator.dart';
+// lib/src/model_analyzer.dart
+//
+// Walks a resolved LibraryElement and extracts every class / enum that is
+// relevant for TypeScript / Zod generation.
+//
+// ── analyzer ^10.0.1 API notes ──────────────────────────────────────────────
+//  • LibraryElement no longer has .topLevelElements, .definingCompilationUnit
+//    or .source.  Use the typed lists directly:
+//      library.classes  → List<ClassElement>
+//      library.enums    → List<EnumElement>
+//  • Element.isSynthetic is deprecated → use:
+//      FieldElement.isOriginDeclaration   (true for real declared fields)
+//      FieldElement.isEnumConstant        (already correct for enums)
+//  • ClassElement.supertype returns InterfaceType? directly.
+//  • ConstructorElement.enclosingElement returns the ClassElement (no .name
+//    suffix needed; just cast or use the typed property).
+//  • EnumElement.fields still exists and isEnumConstant works.
 
-/// Represents a parsed Dart field ready for code generation.
+import 'package:analyzer/dart/element/element.dart';
+import 'package:analyzer/dart/element/nullability_suffix.dart';
+import 'package:analyzer/dart/element/type.dart';
+
+import 'cross_file_registry.dart';
+
+// ── Data models ──────────────────────────────────────────────────────────────
+
+/// Metadata for a single Dart field.
 class FieldInfo {
-  final String? dartName;
-  final String tsName; // from @JsonKey(name:...)
-  final String? dartTypeName;
-  final List<String?> typeArgs;
+  final String name;
+
+  /// Base type name without generics or nullability, e.g. "DLStatus", "String".
+  final String dartType;
+
   final bool isNullable;
-  final bool isIgnored; // @TsIgnore or @JsonKey(ignore: true)
-  final String? converterClass; // e.g. 'DateTimeNullableConverter'
-  final String? defaultValue; // raw Dart literal
-  final String? fromJson; // custom fromJson function name
-  final String? toJson; // custom toJson function name
-  final bool isEnum;
   final bool isList;
   final bool isMap;
-  final bool isModel; // refers to another model class
+  final String? listItemType;
+  final String? mapValueType;
+  final bool isEnum;
+
+  /// Value from `@JsonKey(defaultValue: ...)`.
+  final dynamic defaultValue;
+
+  final bool hasDateTimeConverter;
+  final bool hasDateTimeNullableConverter;
+
+  /// From `@JsonKey(name: '...')`.
+  final String? jsonKeyName;
+
+  final bool isIgnored;
 
   const FieldInfo({
-    this.dartName,
-    required this.tsName,
-    this.dartTypeName,
-    required this.typeArgs,
+    required this.name,
+    required this.dartType,
     required this.isNullable,
-    required this.isIgnored,
-    this.converterClass,
+    this.isList = false,
+    this.isMap = false,
+    this.listItemType,
+    this.mapValueType,
+    this.isEnum = false,
     this.defaultValue,
-    this.fromJson,
-    this.toJson,
-    required this.isEnum,
-    required this.isList,
-    required this.isMap,
-    required this.isModel,
+    this.hasDateTimeConverter = false,
+    this.hasDateTimeNullableConverter = false,
+    this.jsonKeyName,
+    this.isIgnored = false,
   });
+
+  String get effectiveJsonName => jsonKeyName ?? name;
 }
 
-/// Represents a parsed Dart class (model or enum).
+/// Metadata for a Dart class or enum.
 class ClassInfo {
-  final String? name;
-  final String? superclassName; // direct parent (if not Object)
-  final List<FieldInfo> fields;
+  final String name;
+  final String assetPath;
   final bool isEnum;
-  final List<String?> enumValues;
-  final bool isAbstract;
+  final List<String> enumValues;
+  final List<FieldInfo> ownFields;
+  final List<FieldInfo> inheritedFields;
+  final String? superclassName;
+  final bool hasJsonSerializable;
 
   const ClassInfo({
-    this.name,
+    required this.name,
+    required this.assetPath,
+    this.isEnum = false,
+    this.enumValues = const [],
+    this.ownFields = const [],
+    this.inheritedFields = const [],
     this.superclassName,
-    required this.fields,
-    required this.isEnum,
-    required this.enumValues,
-    required this.isAbstract,
+    this.hasJsonSerializable = false,
   });
+
+  List<FieldInfo> get allFields => [...inheritedFields, ...ownFields];
 }
 
-/// Parses Dart [ClassElement] into [ClassInfo].
+// ── Analyzer ────────────────────────────────────────────────────────────────
+
 class ModelAnalyzer {
-  /// Set of known model names in the current library (for isModel detection)
-  final Set<String> knownModelNames;
+  final CrossFileRegistry _registry;
 
-  /// Set of known enum names
-  final Set<String> knownEnumNames;
+  ModelAnalyzer(this._registry);
 
-  /// Cache of constructor defaults per class (populated lazily from source)
-  final Map<String, Map<String, String>> _constructorDefaultsCache = {};
+  // ── Public entry point ────────────────────────────────────────────────────
 
-  ModelAnalyzer({
-    required this.knownModelNames,
-    required this.knownEnumNames,
-  });
+  /// Analyse [library] and return all [ClassInfo] objects.
+  ///
+  /// Uses `library.classes` and `library.enums` — the correct API for
+  /// analyzer >=7.x (replaces the removed `topLevelElements`).
+  List<ClassInfo> analyzeLibrary(LibraryElement library, String assetPath) {
+    final results = <ClassInfo>[];
 
-  ClassInfo analyzeClass(ClassElement element) {
-    if (element is EnumElement) {
-      return _analyzeEnum(element);
+    // ── Enums ────────────────────────────────────────────────────────────────
+    for (final element in library.enums) {
+      results.add(_analyzeEnum(element, assetPath));
     }
-    return _analyzeModel(element);
+
+    // ── Classes ───────────────────────────────────────────────────────────────
+    for (final element in library.classes) {
+      if (element.name!.startsWith('_')) continue;
+      final info = _analyzeClass(element, assetPath);
+      if (info != null) results.add(info);
+    }
+
+    return results;
   }
 
-  ClassInfo _analyzeEnum(ClassElement element) {
+  // ── Enum ──────────────────────────────────────────────────────────────────
+
+  ClassInfo _analyzeEnum(EnumElement element, String assetPath) {
     final values = element.fields
         .where((f) => f.isEnumConstant)
         .map((f) => f.name)
         .toList();
+
     return ClassInfo(
-      name: element.name,
-      fields: [],
+      name: element.name!,
+      assetPath: assetPath,
       isEnum: true,
-      enumValues: values,
-      isAbstract: false,
+      enumValues: values.whereType<String>().toList(),
     );
   }
 
-  ClassInfo _analyzeModel(ClassElement element) {
-    final superName = _resolveSuperclass(element);
-    final fields = <FieldInfo>[];
+  // ── Class ─────────────────────────────────────────────────────────────────
 
-    for (final field in element.fields) {
-      final getter = field.getter;
+  ClassInfo? _analyzeClass(ClassElement element, String assetPath) {
+    final hasJsonSerializable = _hasAnnotationNamed(
+      element,
+      'JsonSerializable',
+    );
 
-      // Skip synthetic-like fields
-      if (getter == null || getter.isAbstract) continue;
+    // Own fields: declared directly on this class.
+    // isOriginDeclaration == true  →  real declared field (not a synthetic
+    // getter/setter created by the compiler).
+    final ownFields = element.fields
+        .where((f) => !f.isStatic && f.isOriginDeclaration)
+        .map(_analyzeField)
+        .whereType<FieldInfo>()
+        .toList();
 
-      final info = _analyzeField(field);
-      if (info != null) fields.add(info);
-    }
+    // Inherited fields from the full superclass chain.
+    final inheritedFields = _collectInheritedFields(element);
 
     return ClassInfo(
-      name: element.name,
-      superclassName: superName,
-      fields: fields,
-      isEnum: false,
-      enumValues: [],
-      isAbstract: element.isAbstract,
+      name: element.name!,
+      assetPath: assetPath,
+      ownFields: ownFields,
+      inheritedFields: inheritedFields,
+      superclassName: _superclassName(element),
+      hasJsonSerializable: hasJsonSerializable,
     );
   }
 
-  String? _resolveSuperclass(ClassElement element) {
-    final supertype = element.supertype;
-    if (supertype == null) return null;
-    final name = supertype.element.name;
-    if (name == 'Object' || name == 'dynamic') return null;
-    return name;
+  // ── Inherited fields ──────────────────────────────────────────────────────
+
+  List<FieldInfo> _collectInheritedFields(
+    ClassElement element, [
+    int depth = 0,
+  ]) {
+    if (depth > 8) return const [];
+
+    // ClassElement.supertype returns InterfaceType? in analyzer >=7.
+    final superType = element.supertype;
+    if (superType == null) return const [];
+
+    final superEl = superType.element;
+    if (superEl is! ClassElement || superEl.name == 'Object') return const [];
+
+    // Recurse so deepest ancestor fields appear first.
+    final ancestorFields = _collectInheritedFields(superEl, depth + 1);
+
+    final parentFields = superEl.fields
+        .where((f) => !f.isStatic && f.isOriginDeclaration)
+        .map(_analyzeField)
+        .whereType<FieldInfo>()
+        .toList();
+
+    return [...ancestorFields, ...parentFields];
   }
+
+  // ── Single field ──────────────────────────────────────────────────────────
 
   FieldInfo? _analyzeField(FieldElement field) {
-    // Check for @TsIgnore
-    if (_hasAnnotation(field, 'TsIgnore')) return null;
-
-    // Parse @JsonKey annotation
-    final jsonKey = _getAnnotation(field, 'JsonKey');
-    bool isIgnored = false;
-    String? jsonName;
-    String? defaultValue;
-    String? fromJson;
-    String? toJson;
+    // ── @JsonKey ──────────────────────────────────────────────────────────
+    final jsonKey = _getAnnotationNamed(field, 'JsonKey');
 
     if (jsonKey != null) {
-      // In newer json_annotation, 'ignore' was split into includeFromJson /
-      // includeToJson. Support both the legacy 'ignore' field and the newer ones.
-      final legacyIgnore = _getBoolField(jsonKey, 'ignore') ?? false;
-      final includeFromJson = _getBoolField(jsonKey, 'includeFromJson') ?? true;
-      final includeToJson = _getBoolField(jsonKey, 'includeToJson') ?? true;
-
-      if (legacyIgnore || (!includeFromJson && !includeToJson)) {
-        isIgnored = true;
-      }
-
-      jsonName = _getStringField(jsonKey, 'name');
-      defaultValue = _getDefaultValueLiteral(jsonKey);
-      fromJson = _getFunctionName(jsonKey, 'fromJson');
-      toJson = _getFunctionName(jsonKey, 'toJson');
+      if (_boolField(jsonKey, 'ignore') == true) return null;
+      if (_boolField(jsonKey, 'includeFromJson') == false) return null;
+      if (_boolField(jsonKey, 'includeToJson') == false) return null;
     }
 
-    if (isIgnored) return null;
+    final type = field.type;
+    final isNullable = type.nullabilitySuffix == NullabilitySuffix.question;
 
-    // Check for converter annotation on the field
-    final converterClass = _detectConverter(field);
+    // ── Converter annotations ─────────────────────────────────────────────
+    final hasDateTimeConv = _hasAnnotationNamed(field, 'DateTimeConverter');
+    final hasDateTimeNullableConv = _hasAnnotationNamed(
+      field,
+      'DateTimeNullableConverter',
+    );
 
-    // Parse type
-    final typeInfo = _parseType(field.type);
+    // ── Collection detection ──────────────────────────────────────────────
+    bool isList = false, isMap = false;
+    String? listItemType, mapValueType;
 
-    // Determine default from constructor if not from @JsonKey
-    final constructorDefault = defaultValue ?? _getConstructorDefault(field);
+    if (type is InterfaceType) {
+      final typeName = type.element.name;
+      if (typeName == 'List' && type.typeArguments.isNotEmpty) {
+        isList = true;
+        listItemType = _baseTypeName(type.typeArguments.first);
+      } else if (typeName == 'Map' && type.typeArguments.length >= 2) {
+        isMap = true;
+        mapValueType = _baseTypeName(type.typeArguments[1]);
+      }
+    }
+
+    // ── Enum detection ────────────────────────────────────────────────────
+    final baseType = _baseTypeName(type);
+    final isEnum = _isKnownEnum(type);
+
+    // ── @JsonKey default + name ───────────────────────────────────────────
+    dynamic defaultValue;
+    String? jsonKeyName;
+    if (jsonKey != null) {
+      defaultValue = _readDefaultValue(jsonKey);
+      jsonKeyName = _stringField(jsonKey, 'name');
+    }
 
     return FieldInfo(
-      dartName: field.name,
-      tsName: jsonName ?? _camelToSnakeOrKeep(field.name),
-      dartTypeName: typeInfo.typeName,
-      typeArgs: typeInfo.typeArgs,
-      isNullable: typeInfo.isNullable,
-      isIgnored: false,
-      converterClass: converterClass,
-      defaultValue: constructorDefault,
-      fromJson: fromJson,
-      toJson: toJson,
-      isEnum: knownEnumNames.contains(typeInfo.typeName),
-      isList: typeInfo.typeName == 'List' || typeInfo.typeName == 'Iterable',
-      isMap: typeInfo.typeName == 'Map',
-      isModel: _isModelType(typeInfo.typeName),
+      name: field.name!,
+      dartType: baseType,
+      isNullable: isNullable,
+      isList: isList,
+      isMap: isMap,
+      listItemType: listItemType,
+      mapValueType: mapValueType,
+      isEnum: isEnum,
+      defaultValue: defaultValue,
+      hasDateTimeConverter: hasDateTimeConv,
+      hasDateTimeNullableConverter: hasDateTimeNullableConv,
+      jsonKeyName: jsonKeyName,
     );
   }
 
-  _TypeInfo _parseType(DartType type) {
-    // analyzer >=6.x: nullabilitySuffix is a proper enum; compare directly.
-    final isNullable = type.nullabilitySuffix == NullabilitySuffix.question;
+  // ── Type helpers ──────────────────────────────────────────────────────────
 
-    if (type is InterfaceType) {
-      final name = type.element.name;
-      final args =
-          type.typeArguments.map((a) => _parseType(a).typeName).toList();
-      return _TypeInfo(name, isNullable, args);
-    }
-
-    // Fallback for other types (TypeParameterType, FunctionType, etc.)
-    final name =
-        type.element?.name ?? type.getDisplayString().replaceAll('?', '');
-    return _TypeInfo(name, isNullable, []);
+  String _baseTypeName(DartType type) {
+    if (type is InterfaceType) return type.element.name!;
+    // Handle TypeParameterType, FunctionType, etc.
+    final raw = type.toString().replaceAll('?', '');
+    return raw.split('<').first.trim();
   }
 
-  bool _isModelType(String? typeName) {
-    return knownModelNames.contains(typeName) &&
-        !knownEnumNames.contains(typeName);
+  bool _isKnownEnum(DartType type) {
+    if (type is InterfaceType && type.element is EnumElement) return true;
+    return _registry.isEnum(_baseTypeName(type));
   }
 
-  String? _detectConverter(FieldElement field) {
-    // analyzer >=6.x: field.metadata is List<ElementAnnotation> directly.
-    for (final metadata in field.metadata.annotations) {
-      final element = metadata.element;
-      if (element == null) continue;
+  String? _superclassName(ClassElement element) {
+    final s = element.supertype;
+    if (s == null || s.element.name == 'Object') return null;
+    return s.element.name;
+  }
 
-      String? className;
-      if (element is ConstructorElement) {
-        // analyzer >=6.x: enclosingElement3 replaces enclosingElement for
-        // named-type lookups; falls back gracefully if not available.
-        className = (element.enclosingElement as InterfaceElement?)?.name ??
-            element.enclosingElement.name;
-      } else if (element is PropertyAccessorElement) {
-        className = element.returnType.element?.name;
+  // ── Annotation helpers ────────────────────────────────────────────────────
+
+  bool _hasAnnotationNamed(Element element, String annotationName) {
+    return element.metadata.annotations.any((m) {
+      final el = m.element;
+      // In analyzer ^10, ConstructorElement.enclosingElement returns
+      // the InterfaceElement (ClassElement / EnumElement).
+      if (el is ConstructorElement) {
+        return el.enclosingElement.name == annotationName;
       }
-
-      if (className != null && _looksLikeConverter(className)) {
-        return className;
-      }
-    }
-    return null;
-  }
-
-  bool _looksLikeConverter(String name) {
-    final lower = name.toLowerCase();
-    return lower.contains('converter') ||
-        lower.contains('transformer') ||
-        lower.contains('serializer');
-  }
-
-  bool _hasAnnotation(FieldElement field, String annotationName) {
-    // analyzer >=6.x: field.metadata is List<ElementAnnotation> directly.
-    return field.metadata.annotations.any((m) {
-      final element = m.element;
-      if (element is ConstructorElement) {
-        final enclosing = element.enclosingElement as InterfaceElement?;
-        return (enclosing?.name ?? element.enclosingElement.name) ==
-            annotationName;
-      }
-      if (element is PropertyAccessorElement) {
-        return element.name == annotationName;
+      if (el is PropertyAccessorElement) {
+        return el.name == annotationName;
       }
       return false;
     });
   }
 
-  ElementAnnotation? _getAnnotation(FieldElement field, String name) {
-    for (final meta in field.metadata.annotations) {
-      final element = meta.element;
-      String? className;
-      if (element is ConstructorElement) {
-        final enclosing = element.enclosingElement as InterfaceElement?;
-        className = enclosing?.name ?? element.enclosingElement.name;
-      } else if (element is PropertyAccessorElement) {
-        className = element.name;
+  ElementAnnotation? _getAnnotationNamed(
+    Element element,
+    String annotationName,
+  ) {
+    for (final m in element.metadata.annotations) {
+      final el = m.element;
+      if (el is ConstructorElement &&
+          el.enclosingElement.name == annotationName) {
+        return m;
       }
-      if (className == name) return meta;
     }
     return null;
   }
 
-  bool? _getBoolField(ElementAnnotation annotation, String fieldName) {
+  // ── Constant value readers ────────────────────────────────────────────────
+
+  bool? _boolField(ElementAnnotation ann, String fieldName) {
     try {
-      final value = annotation.computeConstantValue();
-      final field = value?.getField(fieldName);
-      return field?.toBoolValue();
+      return ann.computeConstantValue()?.getField(fieldName)?.toBoolValue();
     } catch (_) {
       return null;
     }
   }
 
-  String? _getStringField(ElementAnnotation annotation, String fieldName) {
+  String? _stringField(ElementAnnotation ann, String fieldName) {
     try {
-      final value = annotation.computeConstantValue();
-      return value?.getField(fieldName)?.toStringValue();
+      return ann.computeConstantValue()?.getField(fieldName)?.toStringValue();
     } catch (_) {
       return null;
     }
   }
 
-  String? _getDefaultValueLiteral(ElementAnnotation annotation) {
+  /// Extracts the `defaultValue` from `@JsonKey(defaultValue: ...)`.
+  /// Returns bool / int / double / String / List<dynamic> or null.
+  dynamic _readDefaultValue(ElementAnnotation ann) {
     try {
-      final value = annotation.computeConstantValue();
-      final defaultField = value?.getField('defaultValue');
-      if (defaultField == null || defaultField.isNull) return null;
-      return _dartObjectToLiteral(defaultField);
-    } catch (_) {
-      return null;
-    }
-  }
+      final obj = ann.computeConstantValue()?.getField('defaultValue');
+      if (obj == null || obj.isNull) return null;
 
-  String? _dartObjectToLiteral(DartObject obj) {
-    if (obj.isNull) return null;
-    final boolVal = obj.toBoolValue();
-    if (boolVal != null) return boolVal.toString();
-    final intVal = obj.toIntValue();
-    if (intVal != null) return intVal.toString();
-    final doubleVal = obj.toDoubleValue();
-    if (doubleVal != null) return doubleVal.toString();
-    final stringVal = obj.toStringValue();
-    if (stringVal != null) return '"$stringVal"';
-    final listVal = obj.toListValue();
-    if (listVal != null) {
-      if (listVal.isEmpty) return '[]';
-      final items = listVal.map((e) => _dartObjectToLiteral(e) ?? 'null');
-      return '[${items.join(', ')}]';
-    }
-    final mapVal = obj.toMapValue();
-    if (mapVal != null && mapVal.isEmpty) return '{}';
+      final t = obj.type;
+      if (t == null) return null;
 
-    // Enum value: get the field name
-    final variable =
-        obj.variable; // analyzer >=6.x: variable2 replaces variable
-    if (variable != null) {
-      return '"${variable.name}"';
-    }
-    return null;
-  }
+      if (t.isDartCoreBool) return obj.toBoolValue();
+      if (t.isDartCoreInt) return obj.toIntValue();
+      if (t.isDartCoreDouble) return obj.toDoubleValue();
+      if (t.isDartCoreString) return obj.toStringValue();
 
-  String? _getFunctionName(ElementAnnotation annotation, String fieldName) {
-    try {
-      final value = annotation.computeConstantValue();
-      final fn = value?.getField(fieldName);
-      // Functions can't really be evaluated as constants, but we detect presence
-      if (fn != null && !fn.isNull) return '__custom__';
+      // Enum default — e.g. `CallStatus.pending`.
+      // The DartObject has fields; look for the '_name' field (synthetic).
+      final nameField = obj.getField('_name') ?? obj.getField('name');
+      if (nameField != null) return nameField.toStringValue();
+
+      // List default — e.g. `[]`.
+      final listVal = obj.toListValue();
+      if (listVal != null) return <dynamic>[];
+
       return null;
     } catch (_) {
       return null;
     }
   }
-
-  String? _getConstructorDefault(FieldElement field) {
-    try {
-      final cls = field.enclosingElement;
-      if (cls is! ClassElement) return null;
-
-      // Lazy-load defaults from source for this class
-      if (!_constructorDefaultsCache.containsKey(cls.name)) {
-        _constructorDefaultsCache[cls.name!] = _loadDefaultsForClass(cls);
-      }
-
-      final defaults = _constructorDefaultsCache[cls.name]!;
-      final raw = defaults[field.name];
-      if (raw == null) return null;
-
-      return TypeMapping.resolveLiteralDefault(raw);
-    } catch (_) {
-      return null;
-    }
-  }
-
-  Map<String, String> _loadDefaultsForClass(ClassElement cls) {
-    try {
-      final fragment = cls.firstFragment;
-      final source = fragment.libraryFragment.source;
-
-      final fullSource = source.contents.data;
-
-      final offset = fragment.nameOffset ?? 0;
-      final nameLength = cls.name!.length;
-      final end = offset + nameLength + 2000;
-
-      final classSlice = fullSource.substring(
-        offset.clamp(0, fullSource.length),
-        end.clamp(0, fullSource.length),
-      );
-
-      final ctorDefaults = ConstructorDefaultExtractor.extract(classSlice);
-      final fieldDefaults = FieldInitializerExtractor.extract(classSlice);
-
-      return {...fieldDefaults, ...ctorDefaults};
-    } catch (_) {
-      return {};
-    }
-  }
-
-  String _camelToSnakeOrKeep(String? name) =>
-      name ?? ''; // json_serializable keeps camelCase by default
-}
-
-class _TypeInfo {
-  final String? typeName;
-  final bool isNullable;
-  final List<String?> typeArgs;
-
-  _TypeInfo(this.typeName, this.isNullable, this.typeArgs);
 }
 
 --- END FILE ---
 
 FILE: ./lib/src/zod_generator.dart
+// lib/src/zod_generator.dart
+//
+// Converts [ClassInfo] / [FieldInfo] into TypeScript + Zod source text.
+//
+// ── Fix: circular-reference "implicitly has type 'any'" (TS7022) ────────────
+// TypeScript cannot infer the type of a `const` that references itself
+// (directly or indirectly through other schemas). Adding `: z.ZodTypeAny`
+// breaks the inference cycle.
+//
+//   Before:  export const FooSchema = z.object({ … });
+//   After:   export const FooSchema: z.ZodTypeAny = z.object({ … });
+
 import 'model_analyzer.dart';
-import 'type_mapping.dart';
 import 'cross_file_registry.dart';
 
-/// Generates TypeScript + Zod schema strings from [ClassInfo] objects.
-class ZodSchemaGenerator {
-  final Map<String, ClassInfo> classRegistry;
-  final GeneratorConfig config;
-  final CrossFileRegistry? crossFileRegistry;
-  final String? currentOutputFile;
+class ZodGenerator {
+  final CrossFileRegistry _registry;
+  final bool dateTimeAsString;
 
-  ZodSchemaGenerator({
-    required this.classRegistry,
-    required this.config,
-    this.crossFileRegistry,
-    this.currentOutputFile,
-  });
+  ZodGenerator(this._registry, {this.dateTimeAsString = false});
 
-  /// Generate full TS output for a list of classes.
-  String generateFile(List<ClassInfo> classes) {
-    final buf = StringBuffer();
+  String generateFile(List<ClassInfo> classes, String assetPath) {
+    if (classes.isEmpty) return '';
 
-    // Separate enums and models, preserve declaration order
-    final enums = classes.where((c) => c.isEnum).toList();
-    final models = classes.where((c) => !c.isEnum).toList();
-    final sorted = _topologicalSort(models);
-
-    // Collect all external type references for cross-file imports
-    final externalRefs = _collectExternalTypeRefs(classes);
-
-    // Header
-    buf.writeln('// AUTO-GENERATED by dart_ts_generator. DO NOT EDIT.');
-    buf.writeln('// Generated at: ${DateTime.now().toIso8601String()}');
-    buf.writeln();
-
-    // Zod + cross-file imports
-    if (crossFileRegistry != null &&
-        currentOutputFile != null &&
-        externalRefs.isNotEmpty) {
-      buf.writeln(ImportHeaderGenerator.generate(
-        currentFile: currentOutputFile!,
-        referencedTypes: externalRefs.toList(),
-        registry: crossFileRegistry!,
-        zodImport: config.zodImport,
-      ));
-    } else {
-      buf.writeln("import { z } from '${config.zodImport}';");
-    }
-    buf.writeln();
-
-    // Enums first
-    for (final e in enums) {
-      buf.writeln(_generateEnum(e));
-    }
-
-    if (enums.isNotEmpty) buf.writeln();
-
-    // Models
-    for (final m in sorted) {
-      if (m.isAbstract && m.fields.isEmpty) continue;
-      buf.writeln(_generateModel(m));
-    }
-
-    return buf.toString();
-  }
-
-  /// Collect type names that are referenced but NOT defined in [classes].
-  Set<String> _collectExternalTypeRefs(List<ClassInfo> classes) {
-    final localNames = classes.map((c) => c.name).toSet();
-    final refs = <String>{};
+    final importSet = <String>{};
+    final bodyBlocks = <String>[];
 
     for (final cls in classes) {
-      if (cls.superclassName != null &&
-          !localNames.contains(cls.superclassName)) {
-        refs.add(cls.superclassName!);
-      }
-      for (final field in cls.fields) {
-        final typeName = field.dartTypeName;
-        if (!localNames.contains(typeName)) {
-          if (field.isModel || field.isEnum) refs.add(typeName!);
-          // Also check list inner types
-          for (final arg in field.typeArgs) {
-            if (classRegistry.containsKey(arg) && !localNames.contains(arg)) {
-              refs.add(arg!);
-            }
-          }
-        }
-      }
-    }
-
-    return refs;
-  }
-
-  String _generateEnum(ClassInfo info) {
-    final values = info.enumValues.map((v) => '"$v"').join(', ');
-    return '''export const ${info.name}Schema = z.enum([$values]);
-export type ${info.name} = z.infer<typeof ${info.name}Schema>;
-''';
-  }
-
-  String _generateModel(ClassInfo info) {
-    final buf = StringBuffer();
-    final schemaName = '${info.name}Schema';
-
-    final parent = info.superclassName;
-    final hasParent = parent != null &&
-        (classRegistry.containsKey(parent) ||
-            (crossFileRegistry?.hasType(parent) ?? false));
-
-    if (hasParent) {
-      buf.writeln('export const $schemaName = ${parent}Schema.extend({');
-    } else {
-      buf.writeln('export const $schemaName = z.object({');
-    }
-
-    for (final field in info.fields) {
-      final zodExpr = _generateFieldZod(field);
-      // Multi-line expressions get extra indent, single-line stay inline
-      if (zodExpr.contains('\n')) {
-        buf.writeln('  ${field.tsName}:');
-        for (final line in zodExpr.split('\n')) {
-          buf.writeln('    $line');
-        }
-        // Remove trailing comma from last line and add it at field level
-        final lines = buf.toString().trimRight().split('\n');
-        final last = lines.removeLast();
-        buf.clear();
-        buf.writeln(lines.join('\n'));
-        buf.writeln('$last,');
+      if (cls.isEnum) {
+        bodyBlocks.add(_generateEnum(cls));
       } else {
-        buf.writeln('  ${field.tsName}: $zodExpr,');
+        final result = _generateClass(cls, assetPath);
+        importSet.addAll(result.imports);
+        bodyBlocks.add(result.code);
       }
     }
 
-    buf.writeln('});');
-    buf.writeln();
-    buf.writeln('export type ${info.name} = z.infer<typeof $schemaName>;');
-    buf.writeln();
-
-    return buf.toString();
+    final lines = <String>["import { z } from 'zod';"];
+    if (importSet.isNotEmpty) {
+      lines.add('');
+      lines.addAll(importSet.toList()..sort());
+    }
+    lines.add('');
+    lines.add(bodyBlocks.join('\n'));
+    return lines.join('\n');
   }
 
-  String _generateFieldZod(FieldInfo field) {
-    if (field.fromJson != null || field.toJson != null) {
-      // Custom fromJson/toJson → treat as z.any()
-      final base = field.isNullable ? 'z.any().optional()' : 'z.any()';
-      if (field.defaultValue != null) {
-        return '$base.default(${field.defaultValue})';
-      }
-      return base;
-    }
-
-    if (field.converterClass != null) {
-      return _generateConverterZod(field);
-    }
-
-    return _generateTypeZod(field);
+  String _generateEnum(ClassInfo cls) {
+    final values = cls.enumValues.map((v) => '"$v"').join(', ');
+    return [
+      '// ── ${cls.name} ──────────────────────────────────────────────────────',
+      'export const ${cls.name}Schema: z.ZodTypeAny = z.enum([$values]);',
+      'export type ${cls.name} = z.infer<typeof ${cls.name}Schema>;',
+    ].join('\n');
   }
 
-  String _generateConverterZod(FieldInfo field) {
-    final converter = field.converterClass!;
-    String schema;
+  _GeneratorResult _generateClass(ClassInfo cls, String fromAssetPath) {
+    final imports = <String>{};
+    final fieldLines = <String>[];
 
-    // Check known converters
-    ConverterTransform? transform;
-    for (final entry in TypeMapping.knownConverters.entries) {
-      if (converter.toLowerCase().contains(entry.key.toLowerCase())) {
-        transform = entry.value;
-        break;
-      }
+    if (cls.inheritedFields.isNotEmpty) {
+      final superName = cls.superclassName ?? 'base class';
+      fieldLines.add('  // ─ inherited from $superName ─');
     }
 
-    if (transform != null) {
-      if (transform.isList || field.isList) {
-        schema = '''z.array(
-    z.any().transform(${transform.transform})
-  )''';
-      } else {
-        schema = 'z.any().transform(${transform.transform})';
-      }
-    } else if (_isDateTimeConverter(converter)) {
-      final nullable = converter.toLowerCase().contains('nullable');
-      final t = nullable
-          ? TypeMapping.knownConverters['DateTimeNullableConverter']!.transform
-          : TypeMapping.knownConverters['DateTimeConverter']!.transform;
-      schema = 'z.any().transform($t)';
-    } else {
-      schema = 'z.any()';
+    for (final field in cls.allFields) {
+      if (field.isIgnored) continue;
+      final result = _generateField(field, fromAssetPath);
+      imports.addAll(result.imports);
+      fieldLines.add('  ${field.effectiveJsonName}: ${result.zodExpr},');
     }
 
-    if (field.isNullable) schema = '$schema.optional()';
-    if (field.defaultValue != null)
-      schema = '$schema.default(${field.defaultValue})';
+    final schemaName = '${cls.name}Schema';
+    // `: z.ZodTypeAny` annotation prevents TS7022 on circular schema references.
+    final code = [
+      '// ── ${cls.name} ──────────────────────────────────────────────────────',
+      'export const $schemaName: z.ZodTypeAny = z.object({',
+      ...fieldLines,
+      '});',
+      'export type ${cls.name} = z.infer<typeof $schemaName>;',
+    ].join('\n');
 
-    return schema;
+    return _GeneratorResult(code: code, imports: imports);
   }
 
-  bool _isDateTimeConverter(String cls) {
-    final lower = cls.toLowerCase();
-    return lower.contains('datetime') || lower.contains('timestamp');
-  }
+  _FieldResult _generateField(FieldInfo field, String fromAssetPath) {
+    final imports = <String>{};
+    String zodExpr;
 
-  String _generateTypeZod(FieldInfo field) {
-    String schema;
-
-    if (field.isList) {
-      schema = _generateListZod(field);
+    if (field.hasDateTimeConverter || field.hasDateTimeNullableConverter) {
+      zodExpr = dateTimeAsString ? 'z.string()' : 'z.date()';
+    } else if (field.isList) {
+      final item = _zodForType(
+        field.listItemType ?? 'dynamic',
+        fromAssetPath,
+        imports: imports,
+      );
+      zodExpr = 'z.array($item)';
     } else if (field.isMap) {
-      schema = _generateMapZod(field);
-    } else if (field.isEnum) {
-      schema = '${field.dartTypeName}Schema';
-    } else if (field.isModel) {
-      schema = '${field.dartTypeName}Schema';
+      final value = _zodForType(
+        field.mapValueType ?? 'dynamic',
+        fromAssetPath,
+        imports: imports,
+      );
+      zodExpr = 'z.record(z.string(), $value)';
     } else {
-      schema = _resolveScalarZod(field.dartTypeName!);
+      zodExpr = _zodForType(field.dartType, fromAssetPath, imports: imports);
     }
 
-    if (field.isNullable) {
-      schema = '$schema.optional()';
+    if (field.isNullable) zodExpr = '$zodExpr.nullish()';
+
+    final defaultVal = field.defaultValue;
+    if (defaultVal != null) {
+      final tsDefault = _dartDefaultToTs(defaultVal, field);
+      if (tsDefault != null) zodExpr = '$zodExpr.default($tsDefault)';
     }
 
-    if (field.defaultValue != null) {
-      schema = '$schema.default(${field.defaultValue})';
-    }
-
-    return schema;
+    return _FieldResult(zodExpr: zodExpr, imports: imports);
   }
 
-  String _generateListZod(FieldInfo field) {
-    if (field.typeArgs.isEmpty) return 'z.array(z.unknown())';
-
-    final innerType = field.typeArgs[0];
-
-    // Check if inner type is an enum or model
-    if (classRegistry.containsKey(innerType)) {
-      final innerInfo = classRegistry[innerType]!;
-      if (innerInfo.isEnum) {
-        return 'z.array(${innerType}Schema)';
-      }
-      return 'z.array(${innerType}Schema)';
+  String _zodForType(
+    String dartType,
+    String fromAssetPath, {
+    required Set<String> imports,
+  }) {
+    if (dartType == 'DateTime') {
+      return dateTimeAsString ? 'z.string()' : 'z.date()';
     }
 
-    final innerZod = _resolveScalarZod(innerType!);
-    return 'z.array($innerZod)';
+    final primitive = _primitives[dartType];
+    if (primitive != null) return primitive;
+
+    if (_registry.isEnum(dartType)) {
+      final schemaRef = '${dartType}Schema';
+      _addImportIfNeeded(dartType, schemaRef, fromAssetPath, imports);
+      return schemaRef;
+    }
+
+    if (_registry.resolve(dartType) != null) {
+      final schemaRef = '${dartType}Schema';
+      _addImportIfNeeded(dartType, schemaRef, fromAssetPath, imports);
+      return schemaRef;
+    }
+
+    return 'z.unknown()';
   }
 
-  String _generateMapZod(FieldInfo field) {
-    if (field.typeArgs.length < 2) return 'z.record(z.unknown())';
-    final valueType = field.typeArgs[1];
-    final valueZod = classRegistry.containsKey(valueType)
-        ? '${valueType}Schema'
-        : _resolveScalarZod(valueType!);
-    return 'z.record($valueZod)';
+  void _addImportIfNeeded(
+    String typeName,
+    String schemaRef,
+    String fromAssetPath,
+    Set<String> imports,
+  ) {
+    final rel = _registry.relativeImportFor(
+      typeName: typeName,
+      fromSourceAssetPath: fromAssetPath,
+    );
+    if (rel != null) {
+      imports.add("import { $schemaRef } from '$rel';");
+    }
   }
 
-  String _resolveScalarZod(String typeName) {
-    if (TypeMapping.primitiveZodMap.containsKey(typeName)) {
-      return TypeMapping.primitiveZodMap[typeName]!;
-    }
-    if (TypeMapping.timestampTypes.contains(typeName)) {
-      return r'''z.any().transform((val) =>
-    val?.toDate ? val.toDate() : typeof val === "number" ? new Date(val) : val)''';
-    }
-    if (TypeMapping.opaqueFirestoreTypes.contains(typeName)) {
-      return 'z.any()';
-    }
-    if (TypeMapping.firestoreZodMap.containsKey(typeName)) {
-      return TypeMapping.firestoreZodMap[typeName]!;
-    }
-    // Unknown type → assume schema reference
-    return '${typeName}Schema';
-  }
+  static const _primitives = <String, String>{
+    'String': 'z.string()',
+    'int': 'z.number().int()',
+    'double': 'z.number()',
+    'num': 'z.number()',
+    'bool': 'z.boolean()',
+    'DateTime': 'z.date()',
+    'dynamic': 'z.unknown()',
+    'Object': 'z.unknown()',
+    'List': 'z.array(z.unknown())',
+    'Map': 'z.record(z.unknown())',
+    'Set': 'z.array(z.unknown())',
+    'Uint8List': 'z.instanceof(Uint8Array)',
+    'Int8List': 'z.instanceof(Int8Array)',
+    'Uint16List': 'z.instanceof(Uint16Array)',
+    'Int16List': 'z.instanceof(Int16Array)',
+    'Uint32List': 'z.instanceof(Uint32Array)',
+    'Int32List': 'z.instanceof(Int32Array)',
+    'Float32List': 'z.instanceof(Float32Array)',
+    'Float64List': 'z.instanceof(Float64Array)',
+    'ByteData': 'z.instanceof(ArrayBuffer)',
+    'BigInt': 'z.bigint()',
+    'Uri': 'z.string().url()',
+    'Duration': 'z.number()',
+    'RegExp': 'z.instanceof(RegExp)',
+    'Map<String, dynamic>': 'z.record(z.unknown())',
+    'Map<String, Object?>': 'z.record(z.unknown())',
+  };
 
-  /// Topologically sort models so base classes come before derived ones.
-  List<ClassInfo> _topologicalSort(List<ClassInfo> models) {
-    final nameMap = {for (final m in models) m.name: m};
-    final result = <ClassInfo>[];
-    final visited = <String>{};
-
-    void visit(ClassInfo cls) {
-      if (visited.contains(cls.name)) return;
-      visited.add(cls.name!);
-      if (cls.superclassName != null &&
-          nameMap.containsKey(cls.superclassName)) {
-        visit(nameMap[cls.superclassName]!);
-      }
-      result.add(cls);
-    }
-
-    for (final m in models) {
-      visit(m);
-    }
-
-    return result;
+  String? _dartDefaultToTs(dynamic value, FieldInfo field) {
+    if (value == null) return null;
+    if (value is bool) return value ? 'true' : 'false';
+    if (value is int) return '$value';
+    if (value is double) return '$value';
+    if (value is String) return '"$value"';
+    if (value is List) return '[]';
+    return null;
   }
 }
 
-class GeneratorConfig {
-  final String outputDir;
-  final bool generateIndex;
-  final String zodImport;
-  final bool firestoreTransforms;
-  final bool nullSafety;
+class _FieldResult {
+  final String zodExpr;
+  final Set<String> imports;
+  const _FieldResult({required this.zodExpr, required this.imports});
+}
 
-  const GeneratorConfig({
-    this.outputDir = 'lib/generated/ts',
-    this.generateIndex = true,
-    this.zodImport = 'zod',
-    this.firestoreTransforms = true,
-    this.nullSafety = true,
-  });
-
-  factory GeneratorConfig.fromMap(Map<String, dynamic> map) {
-    return GeneratorConfig(
-      outputDir: map['output_dir'] as String? ?? 'lib/generated/ts',
-      generateIndex: map['generate_index'] as bool? ?? true,
-      zodImport: map['zod_import'] as String? ?? 'zod',
-      firestoreTransforms: map['firestore_transforms'] as bool? ?? true,
-      nullSafety: map['null_safety'] as bool? ?? true,
-    );
-  }
+class _GeneratorResult {
+  final String code;
+  final Set<String> imports;
+  const _GeneratorResult({required this.code, required this.imports});
 }
 
 --- END FILE ---
@@ -1423,70 +1339,83 @@ class ConverterTransform {
 --- END FILE ---
 
 FILE: ./lib/index_builder.dart
+// lib/index_builder.dart
+//
+// Generates lib/gen/eimodels.g.ts — a single barrel file that re-exports
+// every .g.ts schema produced by _TsFileBuilder under lib/gen/.
+//
+// Consumers of the npm / git package get one clean import:
+//
+//   import { VehicleSchema, DLStatus } from 'eimodels';
+//
+// TSC compiles lib/gen/ → dist/, so the barrel becomes dist/eimodels.g.js
+// which package.json points at via "main" / "exports".
+//
+// ── Potential name conflict ───────────────────────────────────────────────────
+// If two source files export a symbol with the same name, TypeScript raises:
+//   "Module X has already exported a member named Y."
+// This surfaces at `npm run build` (tsc), not at dart build_runner time.
+// Fix by renaming the Dart class, or by manually editing the generated barrel
+// to use aliased re-exports:  export { Foo as OtherFoo } from './...';
+
 import 'dart:async';
+
 import 'package:build/build.dart';
 import 'package:glob/glob.dart';
-import 'src/cross_file_registry.dart';
+import 'package:path/path.dart' as p;
 
-/// A post-build aggregating step that:
-/// 1. Collects all generated .g.ts files
-/// 2. Produces a barrel `index.ts` re-exporting everything
-///
-/// Register in build.yaml as a separate builder with `build_to: source`.
-class TsIndexBuilder implements Builder {
-  final Map<String, dynamic> config;
+Builder tsIndexBuilder(BuilderOptions options) => _TsIndexBuilder(options);
 
-  TsIndexBuilder(this.config);
-
-  String get outputDir => config['output_dir'] as String? ?? 'lib/generated/ts';
+class _TsIndexBuilder implements Builder {
+  final BuilderOptions _options;
+  _TsIndexBuilder(this._options);
 
   @override
-  Map<String, List<String>> get buildExtensions => {
-        r'$lib$': ['generated/ts/index.ts'],
-      };
+  Map<String, List<String>> get buildExtensions => const {
+    r'$lib$': ['gen/eimodels.g.ts'],
+  };
 
   @override
   Future<void> build(BuildStep buildStep) async {
-    final generatedFiles = <String>[];
+    // Collect all .g.ts files under lib/gen/, excluding the barrel itself
+    // to avoid a circular self-referencing export.
+    final glob = Glob('lib/gen/**.g.ts');
+    final assets =
+        (await buildStep.findAssets(glob).toList())
+            .where((a) => !a.path.endsWith('eimodels.g.ts'))
+            .toList()
+          ..sort((a, b) => a.path.compareTo(b.path));
 
-    // Find all .g.ts files in the output directory
-    await for (final input in buildStep.findAssets(
-      Glob('$outputDir/**.g.ts'),
-    )) {
-      generatedFiles.add(input.path);
-    }
+    if (assets.isEmpty) return;
 
-    // Also check for .ts files (non-.g.ts pattern used by file builder)
-    await for (final input in buildStep.findAssets(
-      Glob('lib/**.g.ts'),
-    )) {
-      final path = input.path;
-      if (!generatedFiles.contains(path)) {
-        generatedFiles.add(path);
-      }
-    }
+    // Barrel lives at lib/gen/eimodels.g.ts — all relative paths from there.
+    const barrelDir = 'lib/gen';
 
-    if (generatedFiles.isEmpty) return;
+    final exportLines = assets.map((asset) {
+      var rel = p.posix.relative(asset.path, from: barrelDir);
+      if (rel.endsWith('.ts')) rel = rel.substring(0, rel.length - 3);
+      if (!rel.startsWith('.')) rel = './$rel';
+      return "export * from '$rel';";
+    });
 
-    generatedFiles.sort();
+    final outputPath =
+        _options.config['barrel_file'] as String? ?? 'lib/gen/eimodels.g.ts';
+    final outputId = AssetId(buildStep.inputId.package, outputPath);
 
-    final outputId = AssetId(
-      buildStep.inputId.package,
-      '$outputDir/index.ts',
-    );
-
-    final content = IndexBarrelGenerator.generate(
-      generatedFiles,
-      outputId.path,
-    );
+    final content = [
+      '// AUTO-GENERATED — DO NOT EDIT.',
+      '// Single barrel — re-exports all Zod schemas generated from Dart models.',
+      '//',
+      '// Usage:',
+      '//   import { VehicleSchema, Vehicle, DLStatus } from "eimodels";',
+      '',
+      ...exportLines,
+      '',
+    ].join('\n');
 
     await buildStep.writeAsString(outputId, content);
-
-    log.info('dart_ts_generator: wrote index.ts with ${generatedFiles.length} exports');
   }
 }
-
-Builder tsIndexBuilder(BuilderOptions options) => TsIndexBuilder(options.config);
 
 --- END FILE ---
 

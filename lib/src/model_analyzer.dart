@@ -1,396 +1,371 @@
-import 'package:analyzer/dart/element/element.dart';
-import 'package:analyzer/dart/element/type.dart';
-import 'package:analyzer/dart/element/nullability_suffix.dart';
-import 'package:analyzer/dart/constant/value.dart';
-import 'package:dart_ts_generator/dart_ts_generator.dart';
+// lib/src/model_analyzer.dart
+//
+// Walks a resolved LibraryElement and extracts every class / enum that is
+// relevant for TypeScript / Zod generation.
+//
+// ── analyzer ^10.0.1 API notes ──────────────────────────────────────────────
+//  • LibraryElement no longer has .topLevelElements, .definingCompilationUnit
+//    or .source.  Use the typed lists directly:
+//      library.classes  → List<ClassElement>
+//      library.enums    → List<EnumElement>
+//  • Element.isSynthetic is deprecated → use:
+//      FieldElement.isOriginDeclaration   (true for real declared fields)
+//      FieldElement.isEnumConstant        (already correct for enums)
+//  • ClassElement.supertype returns InterfaceType? directly.
+//  • ConstructorElement.enclosingElement returns the ClassElement (no .name
+//    suffix needed; just cast or use the typed property).
+//  • EnumElement.fields still exists and isEnumConstant works.
 
-/// Represents a parsed Dart field ready for code generation.
+import 'package:analyzer/dart/element/element.dart';
+import 'package:analyzer/dart/element/nullability_suffix.dart';
+import 'package:analyzer/dart/element/type.dart';
+
+import 'cross_file_registry.dart';
+
+// ── Data models ──────────────────────────────────────────────────────────────
+
+/// Metadata for a single Dart field.
 class FieldInfo {
-  final String? dartName;
-  final String tsName; // from @JsonKey(name:...)
-  final String? dartTypeName;
-  final List<String?> typeArgs;
+  final String name;
+
+  /// Base type name without generics or nullability, e.g. "DLStatus", "String".
+  final String dartType;
+
   final bool isNullable;
-  final bool isIgnored; // @TsIgnore or @JsonKey(ignore: true)
-  final String? converterClass; // e.g. 'DateTimeNullableConverter'
-  final String? defaultValue; // raw Dart literal
-  final String? fromJson; // custom fromJson function name
-  final String? toJson; // custom toJson function name
-  final bool isEnum;
   final bool isList;
   final bool isMap;
-  final bool isModel; // refers to another model class
+  final String? listItemType;
+  final String? mapValueType;
+  final bool isEnum;
+
+  /// Value from `@JsonKey(defaultValue: ...)`.
+  final dynamic defaultValue;
+
+  final bool hasDateTimeConverter;
+  final bool hasDateTimeListConverter;
+
+  final bool hasDateTimeNullableConverter;
+
+  /// From `@JsonKey(name: '...')`.
+  final String? jsonKeyName;
+
+  final bool isIgnored;
 
   const FieldInfo({
-    this.dartName,
-    required this.tsName,
-    this.dartTypeName,
-    required this.typeArgs,
+    required this.name,
+    required this.dartType,
     required this.isNullable,
-    required this.isIgnored,
-    this.converterClass,
+    this.isList = false,
+    this.isMap = false,
+    this.listItemType,
+    this.mapValueType,
+    this.isEnum = false,
     this.defaultValue,
-    this.fromJson,
-    this.toJson,
-    required this.isEnum,
-    required this.isList,
-    required this.isMap,
-    required this.isModel,
+    this.hasDateTimeConverter = false,
+    this.hasDateTimeNullableConverter = false,
+    this.hasDateTimeListConverter = false,
+    this.jsonKeyName,
+    this.isIgnored = false,
   });
+
+  String get effectiveJsonName => jsonKeyName ?? name;
 }
 
-/// Represents a parsed Dart class (model or enum).
+/// Metadata for a Dart class or enum.
 class ClassInfo {
-  final String? name;
-  final String? superclassName; // direct parent (if not Object)
-  final List<FieldInfo> fields;
+  final String name;
+  final String assetPath;
   final bool isEnum;
-  final List<String?> enumValues;
-  final bool isAbstract;
+  final List<String> enumValues;
+  final List<FieldInfo> ownFields;
+  final List<FieldInfo> inheritedFields;
+  final String? superclassName;
+  final bool hasJsonSerializable;
 
   const ClassInfo({
-    this.name,
+    required this.name,
+    required this.assetPath,
+    this.isEnum = false,
+    this.enumValues = const [],
+    this.ownFields = const [],
+    this.inheritedFields = const [],
     this.superclassName,
-    required this.fields,
-    required this.isEnum,
-    required this.enumValues,
-    required this.isAbstract,
+    this.hasJsonSerializable = false,
   });
+
+  List<FieldInfo> get allFields => [...inheritedFields, ...ownFields];
 }
 
-/// Parses Dart [ClassElement] into [ClassInfo].
+// ── Analyzer ────────────────────────────────────────────────────────────────
+
 class ModelAnalyzer {
-  /// Set of known model names in the current library (for isModel detection)
-  final Set<String> knownModelNames;
+  final CrossFileRegistry _registry;
 
-  /// Set of known enum names
-  final Set<String> knownEnumNames;
+  ModelAnalyzer(this._registry);
 
-  /// Cache of constructor defaults per class (populated lazily from source)
-  final Map<String, Map<String, String>> _constructorDefaultsCache = {};
+  // ── Public entry point ────────────────────────────────────────────────────
 
-  ModelAnalyzer({
-    required this.knownModelNames,
-    required this.knownEnumNames,
-  });
+  /// Analyse [library] and return all [ClassInfo] objects.
+  ///
+  /// Uses `library.classes` and `library.enums` — the correct API for
+  /// analyzer >=7.x (replaces the removed `topLevelElements`).
+  List<ClassInfo> analyzeLibrary(LibraryElement library, String assetPath) {
+    final results = <ClassInfo>[];
 
-  ClassInfo analyzeClass(ClassElement element) {
-    if (element is EnumElement) {
-      return _analyzeEnum(element);
+    // ── Enums ────────────────────────────────────────────────────────────────
+    for (final element in library.enums) {
+      results.add(_analyzeEnum(element, assetPath));
     }
-    return _analyzeModel(element);
+
+    // ── Classes ───────────────────────────────────────────────────────────────
+    for (final element in library.classes) {
+      if (element.name!.startsWith('_')) continue;
+      final info = _analyzeClass(element, assetPath);
+      if (info != null) results.add(info);
+    }
+
+    return results;
   }
 
-  ClassInfo _analyzeEnum(ClassElement element) {
+  // ── Enum ──────────────────────────────────────────────────────────────────
+
+  ClassInfo _analyzeEnum(EnumElement element, String assetPath) {
     final values = element.fields
         .where((f) => f.isEnumConstant)
         .map((f) => f.name)
         .toList();
+
     return ClassInfo(
-      name: element.name,
-      fields: [],
+      name: element.name!,
+      assetPath: assetPath,
       isEnum: true,
-      enumValues: values,
-      isAbstract: false,
+      enumValues: values.whereType<String>().toList(),
     );
   }
 
-  ClassInfo _analyzeModel(ClassElement element) {
-    final superName = _resolveSuperclass(element);
-    final fields = <FieldInfo>[];
+  // ── Class ─────────────────────────────────────────────────────────────────
 
-    for (final field in element.fields) {
-      final getter = field.getter;
+  ClassInfo? _analyzeClass(ClassElement element, String assetPath) {
+    final hasJsonSerializable = _hasAnnotationNamed(
+      element,
+      'JsonSerializable',
+    );
 
-      // Skip synthetic-like fields
-      if (getter == null || getter.isAbstract) continue;
+    // Own fields: declared directly on this class.
+    // isOriginDeclaration == true  →  real declared field (not a synthetic
+    // getter/setter created by the compiler).
+    final ownFields = element.fields
+        .where((f) => !f.isStatic && f.isOriginDeclaration)
+        .map(_analyzeField)
+        .whereType<FieldInfo>()
+        .toList();
 
-      final info = _analyzeField(field);
-      if (info != null) fields.add(info);
-    }
+    // Inherited fields from the full superclass chain.
+    final inheritedFields = _collectInheritedFields(element);
 
     return ClassInfo(
-      name: element.name,
-      superclassName: superName,
-      fields: fields,
-      isEnum: false,
-      enumValues: [],
-      isAbstract: element.isAbstract,
+      name: element.name!,
+      assetPath: assetPath,
+      ownFields: ownFields,
+      inheritedFields: inheritedFields,
+      superclassName: _superclassName(element),
+      hasJsonSerializable: hasJsonSerializable,
     );
   }
 
-  String? _resolveSuperclass(ClassElement element) {
-    final supertype = element.supertype;
-    if (supertype == null) return null;
-    final name = supertype.element.name;
-    if (name == 'Object' || name == 'dynamic') return null;
-    return name;
+  // ── Inherited fields ──────────────────────────────────────────────────────
+
+  List<FieldInfo> _collectInheritedFields(
+    ClassElement element, [
+    int depth = 0,
+  ]) {
+    if (depth > 8) return const [];
+
+    // ClassElement.supertype returns InterfaceType? in analyzer >=7.
+    final superType = element.supertype;
+    if (superType == null) return const [];
+
+    final superEl = superType.element;
+    if (superEl is! ClassElement || superEl.name == 'Object') return const [];
+
+    // Recurse so deepest ancestor fields appear first.
+    final ancestorFields = _collectInheritedFields(superEl, depth + 1);
+
+    final parentFields = superEl.fields
+        .where((f) => !f.isStatic && f.isOriginDeclaration)
+        .map(_analyzeField)
+        .whereType<FieldInfo>()
+        .toList();
+
+    return [...ancestorFields, ...parentFields];
   }
+
+  // ── Single field ──────────────────────────────────────────────────────────
 
   FieldInfo? _analyzeField(FieldElement field) {
-    // Check for @TsIgnore
-    if (_hasAnnotation(field, 'TsIgnore')) return null;
-
-    // Parse @JsonKey annotation
-    final jsonKey = _getAnnotation(field, 'JsonKey');
-    bool isIgnored = false;
-    String? jsonName;
-    String? defaultValue;
-    String? fromJson;
-    String? toJson;
+    // ── @JsonKey ──────────────────────────────────────────────────────────
+    final jsonKey = _getAnnotationNamed(field, 'JsonKey');
 
     if (jsonKey != null) {
-      // In newer json_annotation, 'ignore' was split into includeFromJson /
-      // includeToJson. Support both the legacy 'ignore' field and the newer ones.
-      final legacyIgnore = _getBoolField(jsonKey, 'ignore') ?? false;
-      final includeFromJson = _getBoolField(jsonKey, 'includeFromJson') ?? true;
-      final includeToJson = _getBoolField(jsonKey, 'includeToJson') ?? true;
-
-      if (legacyIgnore || (!includeFromJson && !includeToJson)) {
-        isIgnored = true;
-      }
-
-      jsonName = _getStringField(jsonKey, 'name');
-      defaultValue = _getDefaultValueLiteral(jsonKey);
-      fromJson = _getFunctionName(jsonKey, 'fromJson');
-      toJson = _getFunctionName(jsonKey, 'toJson');
+      if (_boolField(jsonKey, 'ignore') == true) return null;
+      if (_boolField(jsonKey, 'includeFromJson') == false) return null;
+      if (_boolField(jsonKey, 'includeToJson') == false) return null;
     }
 
-    if (isIgnored) return null;
+    final type = field.type;
+    final isNullable = type.nullabilitySuffix == NullabilitySuffix.question;
 
-    // Check for converter annotation on the field
-    final converterClass = _detectConverter(field);
+    // ── Converter annotations ─────────────────────────────────────────────
+    final hasDateTimeConv = _hasAnnotationNamed(field, 'DateTimeConverter');
+    final hasDateTimeListConv = _hasAnnotationNamed(
+      field,
+      'DateTimeListConverter',
+    );
+    final hasDateTimeNullableConv = _hasAnnotationNamed(
+      field,
+      'DateTimeNullableConverter',
+    );
 
-    // Parse type
-    final typeInfo = _parseType(field.type);
+    // ── Collection detection ──────────────────────────────────────────────
+    bool isList = false, isMap = false;
+    String? listItemType, mapValueType;
 
-    // Determine default from constructor if not from @JsonKey
-    final constructorDefault = defaultValue ?? _getConstructorDefault(field);
+    if (type is InterfaceType) {
+      final typeName = type.element.name;
+      if (typeName == 'List' && type.typeArguments.isNotEmpty) {
+        isList = true;
+        listItemType = _baseTypeName(type.typeArguments.first);
+      } else if (typeName == 'Map' && type.typeArguments.length >= 2) {
+        isMap = true;
+        mapValueType = _baseTypeName(type.typeArguments[1]);
+      }
+    }
+
+    // ── Enum detection ────────────────────────────────────────────────────
+    final baseType = _baseTypeName(type);
+    final isEnum = _isKnownEnum(type);
+
+    // ── @JsonKey default + name ───────────────────────────────────────────
+    dynamic defaultValue;
+    String? jsonKeyName;
+    if (jsonKey != null) {
+      defaultValue = _readDefaultValue(jsonKey);
+      jsonKeyName = _stringField(jsonKey, 'name');
+    }
 
     return FieldInfo(
-      dartName: field.name,
-      tsName: jsonName ?? _camelToSnakeOrKeep(field.name),
-      dartTypeName: typeInfo.typeName,
-      typeArgs: typeInfo.typeArgs,
-      isNullable: typeInfo.isNullable,
-      isIgnored: false,
-      converterClass: converterClass,
-      defaultValue: constructorDefault,
-      fromJson: fromJson,
-      toJson: toJson,
-      isEnum: knownEnumNames.contains(typeInfo.typeName),
-      isList: typeInfo.typeName == 'List' || typeInfo.typeName == 'Iterable',
-      isMap: typeInfo.typeName == 'Map',
-      isModel: _isModelType(typeInfo.typeName),
+      name: field.name!,
+      dartType: baseType,
+      isNullable: isNullable,
+      isList: isList,
+      isMap: isMap,
+      listItemType: listItemType,
+      mapValueType: mapValueType,
+      isEnum: isEnum,
+      defaultValue: defaultValue,
+      hasDateTimeConverter: hasDateTimeConv,
+      hasDateTimeListConverter: hasDateTimeListConv,
+      hasDateTimeNullableConverter: hasDateTimeNullableConv,
+      jsonKeyName: jsonKeyName,
     );
   }
 
-  _TypeInfo _parseType(DartType type) {
-    // analyzer >=6.x: nullabilitySuffix is a proper enum; compare directly.
-    final isNullable = type.nullabilitySuffix == NullabilitySuffix.question;
+  // ── Type helpers ──────────────────────────────────────────────────────────
 
-    if (type is InterfaceType) {
-      final name = type.element.name;
-      final args =
-          type.typeArguments.map((a) => _parseType(a).typeName).toList();
-      return _TypeInfo(name, isNullable, args);
-    }
-
-    // Fallback for other types (TypeParameterType, FunctionType, etc.)
-    final name =
-        type.element?.name ?? type.getDisplayString().replaceAll('?', '');
-    return _TypeInfo(name, isNullable, []);
+  String _baseTypeName(DartType type) {
+    if (type is InterfaceType) return type.element.name!;
+    // Handle TypeParameterType, FunctionType, etc.
+    final raw = type.toString().replaceAll('?', '');
+    return raw.split('<').first.trim();
   }
 
-  bool _isModelType(String? typeName) {
-    return knownModelNames.contains(typeName) &&
-        !knownEnumNames.contains(typeName);
+  bool _isKnownEnum(DartType type) {
+    if (type is InterfaceType && type.element is EnumElement) return true;
+    return _registry.isEnum(_baseTypeName(type));
   }
 
-  String? _detectConverter(FieldElement field) {
-    // analyzer >=6.x: field.metadata is List<ElementAnnotation> directly.
-    for (final metadata in field.metadata.annotations) {
-      final element = metadata.element;
-      if (element == null) continue;
+  String? _superclassName(ClassElement element) {
+    final s = element.supertype;
+    if (s == null || s.element.name == 'Object') return null;
+    return s.element.name;
+  }
 
-      String? className;
-      if (element is ConstructorElement) {
-        // analyzer >=6.x: enclosingElement3 replaces enclosingElement for
-        // named-type lookups; falls back gracefully if not available.
-        className = (element.enclosingElement as InterfaceElement?)?.name ??
-            element.enclosingElement.name;
-      } else if (element is PropertyAccessorElement) {
-        className = element.returnType.element?.name;
+  // ── Annotation helpers ────────────────────────────────────────────────────
+
+  bool _hasAnnotationNamed(Element element, String annotationName) {
+    return element.metadata.annotations.any((m) {
+      final el = m.element;
+      // In analyzer ^10, ConstructorElement.enclosingElement returns
+      // the InterfaceElement (ClassElement / EnumElement).
+      if (el is ConstructorElement) {
+        return el.enclosingElement.name == annotationName;
       }
-
-      if (className != null && _looksLikeConverter(className)) {
-        return className;
-      }
-    }
-    return null;
-  }
-
-  bool _looksLikeConverter(String name) {
-    final lower = name.toLowerCase();
-    return lower.contains('converter') ||
-        lower.contains('transformer') ||
-        lower.contains('serializer');
-  }
-
-  bool _hasAnnotation(FieldElement field, String annotationName) {
-    // analyzer >=6.x: field.metadata is List<ElementAnnotation> directly.
-    return field.metadata.annotations.any((m) {
-      final element = m.element;
-      if (element is ConstructorElement) {
-        final enclosing = element.enclosingElement as InterfaceElement?;
-        return (enclosing?.name ?? element.enclosingElement.name) ==
-            annotationName;
-      }
-      if (element is PropertyAccessorElement) {
-        return element.name == annotationName;
+      if (el is PropertyAccessorElement) {
+        return el.name == annotationName;
       }
       return false;
     });
   }
 
-  ElementAnnotation? _getAnnotation(FieldElement field, String name) {
-    for (final meta in field.metadata.annotations) {
-      final element = meta.element;
-      String? className;
-      if (element is ConstructorElement) {
-        final enclosing = element.enclosingElement as InterfaceElement?;
-        className = enclosing?.name ?? element.enclosingElement.name;
-      } else if (element is PropertyAccessorElement) {
-        className = element.name;
+  ElementAnnotation? _getAnnotationNamed(
+    Element element,
+    String annotationName,
+  ) {
+    for (final m in element.metadata.annotations) {
+      final el = m.element;
+      if (el is ConstructorElement &&
+          el.enclosingElement.name == annotationName) {
+        return m;
       }
-      if (className == name) return meta;
     }
     return null;
   }
 
-  bool? _getBoolField(ElementAnnotation annotation, String fieldName) {
+  // ── Constant value readers ────────────────────────────────────────────────
+
+  bool? _boolField(ElementAnnotation ann, String fieldName) {
     try {
-      final value = annotation.computeConstantValue();
-      final field = value?.getField(fieldName);
-      return field?.toBoolValue();
+      return ann.computeConstantValue()?.getField(fieldName)?.toBoolValue();
     } catch (_) {
       return null;
     }
   }
 
-  String? _getStringField(ElementAnnotation annotation, String fieldName) {
+  String? _stringField(ElementAnnotation ann, String fieldName) {
     try {
-      final value = annotation.computeConstantValue();
-      return value?.getField(fieldName)?.toStringValue();
+      return ann.computeConstantValue()?.getField(fieldName)?.toStringValue();
     } catch (_) {
       return null;
     }
   }
 
-  String? _getDefaultValueLiteral(ElementAnnotation annotation) {
+  /// Extracts the `defaultValue` from `@JsonKey(defaultValue: ...)`.
+  /// Returns bool / int / double / String / List<dynamic> or null.
+  dynamic _readDefaultValue(ElementAnnotation ann) {
     try {
-      final value = annotation.computeConstantValue();
-      final defaultField = value?.getField('defaultValue');
-      if (defaultField == null || defaultField.isNull) return null;
-      return _dartObjectToLiteral(defaultField);
-    } catch (_) {
-      return null;
-    }
-  }
+      final obj = ann.computeConstantValue()?.getField('defaultValue');
+      if (obj == null || obj.isNull) return null;
 
-  String? _dartObjectToLiteral(DartObject obj) {
-    if (obj.isNull) return null;
-    final boolVal = obj.toBoolValue();
-    if (boolVal != null) return boolVal.toString();
-    final intVal = obj.toIntValue();
-    if (intVal != null) return intVal.toString();
-    final doubleVal = obj.toDoubleValue();
-    if (doubleVal != null) return doubleVal.toString();
-    final stringVal = obj.toStringValue();
-    if (stringVal != null) return '"$stringVal"';
-    final listVal = obj.toListValue();
-    if (listVal != null) {
-      if (listVal.isEmpty) return '[]';
-      final items = listVal.map((e) => _dartObjectToLiteral(e) ?? 'null');
-      return '[${items.join(', ')}]';
-    }
-    final mapVal = obj.toMapValue();
-    if (mapVal != null && mapVal.isEmpty) return '{}';
+      final t = obj.type;
+      if (t == null) return null;
 
-    // Enum value: get the field name
-    final variable =
-        obj.variable; // analyzer >=6.x: variable2 replaces variable
-    if (variable != null) {
-      return '"${variable.name}"';
-    }
-    return null;
-  }
+      if (t.isDartCoreBool) return obj.toBoolValue();
+      if (t.isDartCoreInt) return obj.toIntValue();
+      if (t.isDartCoreDouble) return obj.toDoubleValue();
+      if (t.isDartCoreString) return obj.toStringValue();
 
-  String? _getFunctionName(ElementAnnotation annotation, String fieldName) {
-    try {
-      final value = annotation.computeConstantValue();
-      final fn = value?.getField(fieldName);
-      // Functions can't really be evaluated as constants, but we detect presence
-      if (fn != null && !fn.isNull) return '__custom__';
+      // Enum default — e.g. `CallStatus.pending`.
+      // The DartObject has fields; look for the '_name' field (synthetic).
+      final nameField = obj.getField('_name') ?? obj.getField('name');
+      if (nameField != null) return nameField.toStringValue();
+
+      // List default — e.g. `[]`.
+      final listVal = obj.toListValue();
+      if (listVal != null) return <dynamic>[];
+
       return null;
     } catch (_) {
       return null;
     }
   }
-
-  String? _getConstructorDefault(FieldElement field) {
-    try {
-      final cls = field.enclosingElement;
-      if (cls is! ClassElement) return null;
-
-      // Lazy-load defaults from source for this class
-      if (!_constructorDefaultsCache.containsKey(cls.name)) {
-        _constructorDefaultsCache[cls.name!] = _loadDefaultsForClass(cls);
-      }
-
-      final defaults = _constructorDefaultsCache[cls.name]!;
-      final raw = defaults[field.name];
-      if (raw == null) return null;
-
-      return TypeMapping.resolveLiteralDefault(raw);
-    } catch (_) {
-      return null;
-    }
-  }
-
-  Map<String, String> _loadDefaultsForClass(ClassElement cls) {
-    try {
-      final fragment = cls.firstFragment;
-      final source = fragment.libraryFragment.source;
-
-      final fullSource = source.contents.data;
-
-      final offset = fragment.nameOffset ?? 0;
-      final nameLength = cls.name!.length;
-      final end = offset + nameLength + 2000;
-
-      final classSlice = fullSource.substring(
-        offset.clamp(0, fullSource.length),
-        end.clamp(0, fullSource.length),
-      );
-
-      final ctorDefaults = ConstructorDefaultExtractor.extract(classSlice);
-      final fieldDefaults = FieldInitializerExtractor.extract(classSlice);
-
-      return {...fieldDefaults, ...ctorDefaults};
-    } catch (_) {
-      return {};
-    }
-  }
-
-  String _camelToSnakeOrKeep(String? name) =>
-      name ?? ''; // json_serializable keeps camelCase by default
-}
-
-class _TypeInfo {
-  final String? typeName;
-  final bool isNullable;
-  final List<String?> typeArgs;
-
-  _TypeInfo(this.typeName, this.isNullable, this.typeArgs);
 }

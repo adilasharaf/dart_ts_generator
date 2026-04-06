@@ -12,16 +12,32 @@
   },
   "license": "ISC",
   "author": "",
-  "type": "commonjs",
-  "main": "index.js",
-  "directories": {
-    "src": "src",
-    "output": "output"
+  "main": "dist/eimodels.g.js",
+  "types": "dist/eimodels.g.d.ts",
+  "exports": {
+    ".": {
+      "require": "./dist/eimodels.g.js",
+      "import": "./dist/eimodels.g.js",
+      "types": "./dist/eimodels.g.d.ts"
+    }
   },
+  "files": [
+    "dist"
+  ],
   "scripts": {
+    "lint": "eslint --ext .js,.ts .",
+    "build": "tsc",
+    "build:watch": "tsc --watch",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "dependencies": {
+    "firebase-admin": "^13.7.0",
     "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@typescript-eslint/eslint-plugin": "^5.62.0",
+    "@typescript-eslint/parser": "^5.62.0",
+    "eslint": "^8.57.1",
+    "typescript": "^5.9.3"
   }
 }
