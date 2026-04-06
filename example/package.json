@@ -1,0 +1,27 @@
+{
+  "name": "eimodels",
+  "version": "1.0.0",
+  "description": "Models package for iTurn.",
+  "homepage": "https://gitlab.com/ucmonks/eimodels#readme",
+  "bugs": {
+    "url": "https://gitlab.com/ucmonks/eimodels/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://gitlab.com/ucmonks/eimodels.git"
+  },
+  "license": "ISC",
+  "author": "",
+  "type": "commonjs",
+  "main": "index.js",
+  "directories": {
+    "src": "src",
+    "output": "output"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "dependencies": {
+    "zod": "^4.3.6"
+  }
+}
