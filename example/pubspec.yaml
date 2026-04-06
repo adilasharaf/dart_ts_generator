@@ -5,22 +5,11 @@ environment:
   sdk: ">=3.10.0 <4.0.0"
 
 dependencies:
-  build_runner: ^2.13.1
-  cloud_firestore: ^6.2.0
+  cloud_firestore: ^3.2.0
   json_annotation: ^4.11.0
 
 dev_dependencies:
   dart_ts_generator:
     path: ../
+  build_runner: ^2.13.1
   json_serializable: ^6.13.1
-
-targets:
-  $default:
-    builders:
-      dart_ts_generator:dart_ts_generator:
-        enabled: true
-        options:
-          output_dir: "lib/generated/ts"
-          generate_index: true
-          zod_import: "zod"
-          firestore_transforms: true
