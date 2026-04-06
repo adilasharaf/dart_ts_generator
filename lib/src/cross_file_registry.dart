@@ -1,104 +1,122 @@
-/// Tracks which schemas are defined in which files so the generator
-/// can emit correct `import` statements when referencing cross-file types.
-///
-/// Example:
-///   EiModel is defined in ei_model.dart → generates ei_model.g.ts
-///   EiUser extends EiModel (in ei_user.dart) → needs:
-///     import { EiModelSchema } from './ei_model.g';
-library;
+// lib/src/cross_file_registry.dart
+//
+// Global registry that maps every Dart type name discovered across all
+// scanned source files to its metadata.
+//
+// ── Import path calculation ───────────────────────────────────────────────────
+// Generated files live at  lib/gen/**/*.g.ts  (not alongside the source).
+// Cross-file imports inside .g.ts files must therefore be relative to
+// lib/gen/, not lib/.
+//
+//   Source:  lib/src/Vehicle.dart        → output: lib/gen/src/Vehicle.g.ts
+//   Source:  lib/src/enums/DLStatus.dart → output: lib/gen/src/enums/DLStatus.g.ts
+//
+//   Import from Vehicle.g.ts → DLStatus.g.ts:
+//     ../enums/DLStatus          (relative from lib/gen/src/ to lib/gen/src/enums/)
 
 import 'package:path/path.dart' as p;
 
-/// Holds a registry of [typeName → sourceFile] mappings accumulated
-/// across an entire build run.
+// ── Data model ──────────────────────────────────────────────────────────────
+
+class TypeInfo {
+  final String name;
+  final bool isEnum;
+  final List<String> enumValues;
+
+  /// Package-relative asset path of the *source* dart file,
+  /// e.g. "lib/src/enums/DLStatus.dart".
+  final String sourceAssetPath;
+
+  final String? superclassName;
+
+  const TypeInfo({
+    required this.name,
+    required this.isEnum,
+    this.enumValues = const [],
+    required this.sourceAssetPath,
+    this.superclassName,
+  });
+}
+
+// ── Registry ────────────────────────────────────────────────────────────────
+
 class CrossFileRegistry {
-  /// Map from class/enum name → the .g.ts file path (relative to output root)
-  final Map<String, String> _typeToFile = {};
+  CrossFileRegistry._();
+  static final CrossFileRegistry instance = CrossFileRegistry._();
 
-  /// Map from .g.ts file → list of type names defined there
-  final Map<String, List<String>> _fileToTypes = {};
+  final Map<String, TypeInfo> _types = {};
+  bool _initialized = false;
 
-  void registerTypes(String outputFilePath, List<String> typeNames) {
-    for (final name in typeNames) {
-      _typeToFile[name] = outputFilePath;
-    }
-    _fileToTypes[outputFilePath] = typeNames;
+  bool get isInitialized => _initialized;
+  void markInitialized() => _initialized = true;
+
+  void reset() {
+    _types.clear();
+    _initialized = false;
   }
 
-  /// Returns the output file path where [typeName] is defined,
-  /// or null if it's defined in the same file (no import needed).
-  String? fileForType(String typeName) => _typeToFile[typeName];
+  void register(TypeInfo info) => _types[info.name] = info;
 
-  /// Given the current file and a referenced type, return the relative
-  /// import path (without extension), or null if same-file.
-  String? importPathFor(String currentFile, String referencedType) {
-    final targetFile = _typeToFile[referencedType];
-    if (targetFile == null || targetFile == currentFile) return null;
+  TypeInfo? resolve(String typeName) => _types[typeName];
+  bool isEnum(String typeName) => _types[typeName]?.isEnum ?? false;
+  List<String> enumValues(String typeName) =>
+      _types[typeName]?.enumValues ?? const [];
+  String? sourceOf(String typeName) => _types[typeName]?.sourceAssetPath;
+  String? superclassOf(String typeName) => _types[typeName]?.superclassName;
+  Iterable<String> get allTypeNames => _types.keys;
 
-    final currentDir = p.dirname(currentFile);
-    var rel = p.relative(targetFile, from: currentDir);
+  // ── Import resolution ─────────────────────────────────────────────────────
 
-    // Remove .ts extension for TS imports
-    if (rel.endsWith('.ts')) {
-      rel = rel.substring(0, rel.length - 3);
+  /// Compute the relative TypeScript import path from the *generated* file
+  /// that is being written ([fromSourceAssetPath]) to the *generated* file
+  /// that defines [typeName].
+  ///
+  /// Both arguments are **source** asset paths (e.g. "lib/src/Vehicle.dart").
+  /// We convert them to their output paths under lib/gen/ before computing
+  /// the relative path.
+  ///
+  /// Returns null if [typeName] is unknown or defined in the same source file.
+  String? relativeImportFor({
+    required String typeName,
+    required String fromSourceAssetPath,
+  }) {
+    final toSourcePath = sourceOf(typeName);
+    if (toSourcePath == null || toSourcePath == fromSourceAssetPath) {
+      return null;
     }
 
-    // Ensure ./ prefix
+    // Convert source paths → lib/gen/ output paths.
+    final fromGenTs = _sourceToGenTsPath(fromSourceAssetPath);
+    final toGenTs = _sourceToGenTsPath(toSourcePath);
+
+    final fromDir = p.posix.dirname(fromGenTs);
+    var rel = p.posix.relative(toGenTs, from: fromDir);
+
     if (!rel.startsWith('.')) rel = './$rel';
+
+    // Strip .ts extension (TypeScript import convention).
+    if (rel.endsWith('.ts')) rel = rel.substring(0, rel.length - 3);
 
     return rel;
   }
 
-  bool hasType(String name) => _typeToFile.containsKey(name);
-}
+  // ── Helpers ───────────────────────────────────────────────────────────────
 
-/// Generates an `index.ts` barrel file that re-exports all generated schemas.
-class IndexBarrelGenerator {
-  static String generate(List<String> outputFiles, String indexFilePath) {
-    final buf = StringBuffer();
-    buf.writeln('// AUTO-GENERATED by dart_ts_generator. DO NOT EDIT.');
-    buf.writeln('// Barrel re-export of all generated schemas.');
-    buf.writeln();
+  /// Maps a source asset path to its generated output path under lib/gen/.
+  ///
+  ///   lib/src/Vehicle.dart        →  lib/gen/src/Vehicle.g.ts
+  ///   lib/src/enums/DLStatus.dart →  lib/gen/src/enums/DLStatus.g.ts
+  String _sourceToGenTsPath(String sourcePath) {
+    // Strip leading lib/
+    final withoutLib = sourcePath.startsWith('lib/')
+        ? sourcePath.substring('lib/'.length)
+        : sourcePath;
 
-    final indexDir = p.dirname(indexFilePath);
+    // Replace .dart with .g.ts
+    final withoutDart = withoutLib.endsWith('.dart')
+        ? withoutLib.substring(0, withoutLib.length - '.dart'.length)
+        : withoutLib;
 
-    for (final file in outputFiles) {
-      var rel = p.relative(file, from: indexDir);
-      if (rel.endsWith('.ts')) rel = rel.substring(0, rel.length - 3);
-      if (!rel.startsWith('.')) rel = './$rel';
-      buf.writeln("export * from '$rel';");
-    }
-
-    return buf.toString();
-  }
-}
-
-/// Generates cross-file import headers for a single output file.
-class ImportHeaderGenerator {
-  static String generate({
-    required String currentFile,
-    required List<String> referencedTypes,
-    required CrossFileRegistry registry,
-    required String zodImport,
-  }) {
-    final buf = StringBuffer();
-    buf.writeln("import { z } from '$zodImport';");
-
-    // Group referenced types by their source file
-    final importMap = <String, List<String>>{};
-
-    for (final type in referencedTypes) {
-      final importPath = registry.importPathFor(currentFile, type);
-      if (importPath != null) {
-        importMap.putIfAbsent(importPath, () => []).add('${type}Schema');
-      }
-    }
-
-    for (final entry in importMap.entries.toList()..sort((a, b) => a.key.compareTo(b.key))) {
-      final symbols = entry.value.join(', ');
-      buf.writeln("import { $symbols } from '${entry.key}';");
-    }
-
-    return buf.toString();
+    return 'lib/gen/$withoutDart.g.ts';
   }
 }

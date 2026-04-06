@@ -1,136 +1,46 @@
-import 'dart:async';
+// lib/src/generator.dart
+//
+// Core generation logic. Orchestrates ModelAnalyzer → ZodGenerator.
+// Does NOT extend source_gen's Generator to avoid part-file conflicts.
 
 import 'package:analyzer/dart/element/element.dart';
 import 'package:build/build.dart';
-import 'package:path/path.dart' as p;
-import 'package:source_gen/source_gen.dart';
+import 'package:dart_ts_generator/dart_ts_generator.dart';
 
-import 'src/model_analyzer.dart';
-import 'src/zod_generator.dart';
+class TsZodGenerator {
+  final BuilderOptions options;
+  final CrossFileRegistry _registry;
+  late final ModelAnalyzer _analyzer;
+  late final ZodGenerator _zodGen;
 
-class DartTsGenerator extends Generator {
-  final Map<String, dynamic> config;
-
-  DartTsGenerator(this.config);
-
-  final _jsonSerializableChecker = TypeChecker.typeNamedLiterally(
-    'JsonSerializable',
-    inPackage: 'json_annotation',
-  );
-
-  final _tsGenerateChecker = TypeChecker.typeNamedLiterally(
-    'TsGenerate',
-    inPackage: 'dart_ts_generator',
-  );
-
-  @override
-  FutureOr<String?> generate(LibraryReader library, BuildStep buildStep) async {
-    final tsContent = await generateForLibrary(library.element, buildStep);
-    if (tsContent == null || tsContent.trim().isEmpty) return null;
-
-    // ── KEY FIX 1: Write the .g.ts file directly, bypassing source_gen's
-    //   Dart formatter entirely. We construct the output AssetId manually
-    //   so we control both the extension AND the output directory.
-    final outputDir = config['output_dir'] as String? ?? 'lib/generated/ts';
-
-    // e.g. lib/models/ei_user.dart → ei_user
-    final baseName = p.basenameWithoutExtension(buildStep.inputId.path);
-
-    final outputId = AssetId(
-      buildStep.inputId.package,
-      '$outputDir/$baseName.g.ts', // e.g. lib/generated/ts/ei_user.g.ts
-    );
-
-    await buildStep.writeAsString(outputId, tsContent);
-
-    // ── KEY FIX 2: Return null so source_gen does NOT try to write or
-    //   format anything itself. If we returned a string here, source_gen
-    //   would pipe it through `dart format` and write a .g.dart part —
-    //   both of which are wrong for TypeScript output.
-    return null;
+  TsZodGenerator(this.options, this._registry) {
+    final dateTimeAsString =
+        options.config['date_time_as_string'] as bool? ?? true;
+    _analyzer = ModelAnalyzer(_registry);
+    _zodGen = ZodGenerator(_registry, dateTimeAsString: dateTimeAsString);
   }
 
-  Future<String?> generateForLibrary(
+  /// Entry point called by the builder for each input asset.
+  ///
+  /// Returns the generated TypeScript source, or empty string to skip.
+  Future<String> generate(
     LibraryElement library,
+    AssetId inputId,
     BuildStep buildStep,
   ) async {
-    final generatorConfig = GeneratorConfig.fromMap(config);
+    final assetPath = inputId.path; // e.g. "lib/src/Vehicle.dart"
 
-    final allClasses = _collectClasses(library);
-    if (allClasses.isEmpty) return null;
+    // Analyze the library
+    final classes = _analyzer.analyzeLibrary(library, assetPath);
 
-    final knownModelNames = allClasses.map((c) => c.name!).toSet();
-    final knownEnumNames = allClasses
-        .whereType<EnumElement>()
-        .map((c) => c.name!)
-        .toSet();
+    if (classes.isEmpty) return '';
 
-    final analyzer = ModelAnalyzer(
-      knownModelNames: knownModelNames,
-      knownEnumNames: knownEnumNames,
-    );
+    // Filter: only emit output for classes that are @JsonSerializable
+    // or enums — skip pure utility files
+    final relevant =
+        classes.where((c) => c.isEnum || c.hasJsonSerializable).toList();
+    if (relevant.isEmpty) return '';
 
-    final classInfos = <ClassInfo>[];
-    for (final cls in allClasses) {
-      try {
-        if (cls is EnumElement) {
-          classInfos.add(_analyzeEnum(cls));
-        } else if (cls is ClassElement) {
-          if (!_shouldGenerate(cls)) continue;
-          classInfos.add(analyzer.analyzeClass(cls));
-        }
-      } catch (e) {
-        log.warning('dart_ts_generator: failed to analyze ${cls.name}: $e');
-      }
-    }
-
-    if (classInfos.isEmpty) return null;
-
-    final registry = {for (final c in classInfos) c.name!: c};
-
-    final zodGen = ZodSchemaGenerator(
-      classRegistry: registry,
-      config: generatorConfig,
-    );
-
-    return zodGen.generateFile(classInfos);
-  }
-
-  List<InterfaceElement> _collectClasses(LibraryElement library) {
-    final result = <InterfaceElement>[];
-    for (final element in library.children) {
-      if (element is EnumElement) result.add(element);
-      if (element is ClassElement) result.add(element);
-      if (element is MixinElement) result.add(element);
-    }
-    return result;
-  }
-
-  bool _shouldGenerate(ClassElement cls) {
-    if (cls.name!.startsWith('_')) return false;
-    if (_jsonSerializableChecker.hasAnnotationOf(cls)) return true;
-    if (_tsGenerateChecker.hasAnnotationOf(cls)) return true;
-    final superName = cls.supertype?.element.name;
-    if (superName != null &&
-        superName != 'Object' &&
-        !superName.startsWith('_')) {
-      return true;
-    }
-    return false;
-  }
-
-  ClassInfo _analyzeEnum(EnumElement element) {
-    final values = element.fields
-        .where((f) => f.isEnumConstant)
-        .map((f) => f.name)
-        .toList();
-
-    return ClassInfo(
-      name: element.name,
-      fields: [],
-      isEnum: true,
-      enumValues: values,
-      isAbstract: false,
-    );
+    return _zodGen.generateFile(relevant, assetPath);
   }
 }

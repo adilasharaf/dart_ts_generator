@@ -1,41 +1,172 @@
+// lib/builder.dart
+//
+// ── Output layout ─────────────────────────────────────────────────────────────
+//
+//   lib/src/Vehicle.dart           →  lib/gen/src/Vehicle.g.ts
+//   lib/src/enums/DLStatus.dart    →  lib/gen/src/enums/DLStatus.g.ts
+//   lib/src/config/AppConfig.dart  →  lib/gen/src/config/AppConfig.g.ts
+//
+// TSC then compiles lib/gen/**/*.g.ts  →  dist/
+// package.json points at dist/ for npm / git-dependency consumers.
+//
+// ── Why the capture-group pattern ────────────────────────────────────────────
+// build_runner validates every AssetId written against the set derived from
+// buildExtensions BEFORE build() runs.  A simple ".dart" → ".g.ts" map only
+// allows writing alongside the source file (lib/src/Foo.g.ts).
+//
+// The `^lib/{{}}.dart` → `lib/gen/{{}}.g.ts` pattern uses build_runner's
+// capture-group syntax:
+//   • `^`    – match the full asset path (not just a suffix).
+//   • `{{}}` – capture group that expands to everything between lib/ and .dart,
+//              e.g. "src/enums/DLStatus" for lib/src/enums/DLStatus.dart.
+//
+// This tells build_runner the exact output path for each input up-front, so
+// writing lib/gen/src/enums/DLStatus.g.ts is pre-approved — no
+// UnexpectedOutputException.
+//
+// We use `buildStep.allowedOutputs.single` to retrieve the pre-computed output
+// AssetId rather than constructing it manually.
+//
+// ── analyzer ^10 API notes ────────────────────────────────────────────────────
+//   • library.classes / library.enums  (replaces topLevelElements)
+//   • library.firstFragment.source.uri (replaces library.source.uri)
+//   • FieldElement.isOriginDeclaration (replaces isSynthetic)
+
+import 'dart:async';
+
+import 'package:analyzer/dart/element/element.dart';
 import 'package:build/build.dart';
-import 'package:source_gen/source_gen.dart';
-import 'generator.dart';
+import 'package:glob/glob.dart';
 
-/// Builder factory called by build_runner.
-Builder dartTsGeneratorBuilder(BuilderOptions options) {
-  return SharedPartBuilder(
-    [DartTsGenerator(options.config)],
-    'dart_ts_generator',
-  );
-}
+import 'src/cross_file_registry.dart';
+import 'src/model_analyzer.dart';
+import 'src/zod_generator.dart';
 
-/// Standalone file-per-file builder (alternative mode).
-Builder dartTsFileBuilder(BuilderOptions options) {
-  return _TsFileBuilder(options.config);
-}
+// ── Factory functions ────────────────────────────────────────────────────────
+
+Builder dartTsFileBuilder(BuilderOptions options) => _TsFileBuilder(options);
+Builder dartTsGeneratorBuilder(BuilderOptions options) =>
+    _TsFileBuilder(options);
+
+// ── Builder ──────────────────────────────────────────────────────────────────
 
 class _TsFileBuilder implements Builder {
-  final Map<String, dynamic> config;
+  final BuilderOptions _options;
 
-  _TsFileBuilder(this.config);
+  _TsFileBuilder(this._options);
 
+  /// Capture-group mapping (resolved by build_runner before build() is called):
+  ///
+  ///   lib/src/Vehicle.dart           →  lib/gen/src/Vehicle.g.ts
+  ///   lib/src/enums/DLStatus.dart    →  lib/gen/src/enums/DLStatus.g.ts
   @override
-  Map<String, List<String>> get buildExtensions => {
-        '.dart': ['.g.ts'],
-      };
+  Map<String, List<String>> get buildExtensions => const {
+    r'^lib/{{}}.dart': ['lib/gen/{{}}.g.ts'],
+  };
 
   @override
   Future<void> build(BuildStep buildStep) async {
     final inputId = buildStep.inputId;
-    final library = await buildStep.inputLibrary;
 
-    final generator = DartTsGenerator(config);
-    final output = await generator.generateForLibrary(library, buildStep);
+    // ── Guards ────────────────────────────────────────────────────────────
+    if (inputId.path.endsWith('.g.dart')) return;
+    if (inputId.path.endsWith('.freezed.dart')) return;
+    if (!await buildStep.canRead(inputId)) return;
 
-    if (output == null || output.trim().isEmpty) return;
+    // ── Pre-scan (once per build session) ─────────────────────────────────
+    final registry = CrossFileRegistry.instance;
+    if (!registry.isInitialized) {
+      registry.reset();
+      await _preScan(buildStep, registry);
+      registry.markInitialized();
+    }
 
-    final outputId = inputId.changeExtension('.g.ts');
-    await buildStep.writeAsString(outputId, output);
+    // ── Resolve library ───────────────────────────────────────────────────
+    LibraryElement library;
+    try {
+      library = await buildStep.inputLibrary;
+    } catch (_) {
+      return;
+    }
+
+    // Skip part files: a part's firstFragment points to the parent library.
+    final fragmentUri = library.firstFragment.source.uri.toString();
+    final inputUri = inputId.uri.toString();
+    if (!fragmentUri.endsWith(inputId.path) && fragmentUri != inputUri) {
+      return;
+    }
+
+    // ── Generate ──────────────────────────────────────────────────────────
+    final dateTimeAsString =
+        _options.config['date_time_as_string'] as bool? ?? true;
+
+    final analyzer = ModelAnalyzer(registry);
+    final zodGen = ZodGenerator(registry, dateTimeAsString: dateTimeAsString);
+
+    final allClasses = analyzer.analyzeLibrary(library, inputId.path);
+    final relevant = allClasses
+        .where((c) => c.isEnum || c.hasJsonSerializable)
+        .toList();
+
+    if (relevant.isEmpty) return;
+
+    final tsSource = zodGen.generateFile(relevant, inputId.path);
+    if (tsSource.trim().isEmpty) return;
+
+    // allowedOutputs.single is the AssetId build_runner pre-computed from the
+    // capture-group pattern — use it instead of constructing the path manually.
+    final outputId = buildStep.allowedOutputs.single;
+    await buildStep.writeAsString(outputId, tsSource);
+  }
+
+  // ── Pre-scan ──────────────────────────────────────────────────────────────
+
+  Future<void> _preScan(BuildStep buildStep, CrossFileRegistry registry) async {
+    final assets = await buildStep.findAssets(Glob('lib/**.dart')).toList();
+
+    await Future.wait(
+      assets.map((asset) async {
+        if (asset.path.endsWith('.g.dart')) return;
+        if (asset.path.endsWith('.freezed.dart')) return;
+
+        LibraryElement lib;
+        try {
+          lib = await buildStep.resolver.libraryFor(asset);
+        } catch (_) {
+          return;
+        }
+
+        for (final e in lib.enums) {
+          final values = e.fields
+              .where((f) => f.isEnumConstant)
+              .map((f) => f.name)
+              .toList();
+          registry.register(
+            TypeInfo(
+              name: e.name!,
+              isEnum: true,
+              enumValues: values.whereType<String>().toList(),
+              sourceAssetPath: asset.path,
+            ),
+          );
+        }
+
+        for (final c in lib.classes) {
+          final superType = c.supertype;
+          final superName =
+              (superType != null && superType.element.name != 'Object')
+              ? superType.element.name
+              : null;
+          registry.register(
+            TypeInfo(
+              name: c.name!,
+              isEnum: false,
+              sourceAssetPath: asset.path,
+              superclassName: superName,
+            ),
+          );
+        }
+      }),
+    );
   }
 }

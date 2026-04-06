@@ -1,64 +1,77 @@
+// lib/index_builder.dart
+//
+// Generates lib/gen/eimodels.g.ts — a single barrel file that re-exports
+// every .g.ts schema produced by _TsFileBuilder under lib/gen/.
+//
+// Consumers of the npm / git package get one clean import:
+//
+//   import { VehicleSchema, DLStatus } from 'eimodels';
+//
+// TSC compiles lib/gen/ → dist/, so the barrel becomes dist/eimodels.g.js
+// which package.json points at via "main" / "exports".
+//
+// ── Potential name conflict ───────────────────────────────────────────────────
+// If two source files export a symbol with the same name, TypeScript raises:
+//   "Module X has already exported a member named Y."
+// This surfaces at `npm run build` (tsc), not at dart build_runner time.
+// Fix by renaming the Dart class, or by manually editing the generated barrel
+// to use aliased re-exports:  export { Foo as OtherFoo } from './...';
+
 import 'dart:async';
+
 import 'package:build/build.dart';
 import 'package:glob/glob.dart';
-import 'src/cross_file_registry.dart';
+import 'package:path/path.dart' as p;
 
-/// A post-build aggregating step that:
-/// 1. Collects all generated .g.ts files
-/// 2. Produces a barrel `index.ts` re-exporting everything
-///
-/// Register in build.yaml as a separate builder with `build_to: source`.
-class TsIndexBuilder implements Builder {
-  final Map<String, dynamic> config;
+Builder tsIndexBuilder(BuilderOptions options) => _TsIndexBuilder(options);
 
-  TsIndexBuilder(this.config);
-
-  String get outputDir => config['output_dir'] as String? ?? 'lib/generated/ts';
+class _TsIndexBuilder implements Builder {
+  final BuilderOptions _options;
+  _TsIndexBuilder(this._options);
 
   @override
-  Map<String, List<String>> get buildExtensions => {
-        r'$lib$': ['generated/ts/index.ts'],
-      };
+  Map<String, List<String>> get buildExtensions => const {
+    r'$lib$': ['gen/eimodels.g.ts'],
+  };
 
   @override
   Future<void> build(BuildStep buildStep) async {
-    final generatedFiles = <String>[];
+    // Collect all .g.ts files under lib/gen/, excluding the barrel itself
+    // to avoid a circular self-referencing export.
+    final glob = Glob('lib/gen/**.g.ts');
+    final assets =
+        (await buildStep.findAssets(glob).toList())
+            .where((a) => !a.path.endsWith('eimodels.g.ts'))
+            .toList()
+          ..sort((a, b) => a.path.compareTo(b.path));
 
-    // Find all .g.ts files in the output directory
-    await for (final input in buildStep.findAssets(
-      Glob('$outputDir/**.g.ts'),
-    )) {
-      generatedFiles.add(input.path);
-    }
+    if (assets.isEmpty) return;
 
-    // Also check for .ts files (non-.g.ts pattern used by file builder)
-    await for (final input in buildStep.findAssets(
-      Glob('lib/**.g.ts'),
-    )) {
-      final path = input.path;
-      if (!generatedFiles.contains(path)) {
-        generatedFiles.add(path);
-      }
-    }
+    // Barrel lives at lib/gen/eimodels.g.ts — all relative paths from there.
+    const barrelDir = 'lib/gen';
 
-    if (generatedFiles.isEmpty) return;
+    final exportLines = assets.map((asset) {
+      var rel = p.posix.relative(asset.path, from: barrelDir);
+      if (rel.endsWith('.ts')) rel = rel.substring(0, rel.length - 3);
+      if (!rel.startsWith('.')) rel = './$rel';
+      return "export * from '$rel';";
+    });
 
-    generatedFiles.sort();
+    final outputPath =
+        _options.config['barrel_file'] as String? ?? 'lib/gen/eimodels.g.ts';
+    final outputId = AssetId(buildStep.inputId.package, outputPath);
 
-    final outputId = AssetId(
-      buildStep.inputId.package,
-      '$outputDir/index.ts',
-    );
-
-    final content = IndexBarrelGenerator.generate(
-      generatedFiles,
-      outputId.path,
-    );
+    final content = [
+      '// AUTO-GENERATED — DO NOT EDIT.',
+      '// Single barrel — re-exports all Zod schemas generated from Dart models.',
+      '//',
+      '// Usage:',
+      '//   import { VehicleSchema, Vehicle, DLStatus } from "eimodels";',
+      '',
+      ...exportLines,
+      '',
+    ].join('\n');
 
     await buildStep.writeAsString(outputId, content);
-
-    log.info('dart_ts_generator: wrote index.ts with ${generatedFiles.length} exports');
   }
 }
-
-Builder tsIndexBuilder(BuilderOptions options) => TsIndexBuilder(options.config);
