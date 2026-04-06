@@ -3,8 +3,8 @@ description: >
   A build_runner code generator that converts Dart models and enums into
   TypeScript + Zod schemas. Supports enums, nullable types, defaults,
   nested models, inheritance, DateTime converters, and cross-file imports.
-  
-version: 2.0.0
+
+version: 2.0.1
 repository: https://github.com/your-org/dart_ts_generator
 
 environment:
@@ -17,7 +17,6 @@ dependencies:
   # Dart static analysis – used to read class/enum/field metadata
   analyzer: ^10.0.1
 
-
   # Source gen utilities (LibraryReader, TypeChecker, etc.)
   source_gen: ^4.2.2
 
@@ -27,8 +26,8 @@ dependencies:
   # Path manipulation for relative import computation
   path: ^1.9.1
 
-  cloud_firestore: ^3.2.0
-  json_annotation: ^4.11.0
+  cloud_firestore: ^6.0.3
+  json_annotation: ^4.9.0
 
 dev_dependencies:
   # Run code generation
@@ -40,6 +39,6 @@ dev_dependencies:
   # Dart lints
   lints: ^6.1.0
 
-  test: ^1.31.0
+  test: ^1.30.0
 
-  json_serializable: ^6.13.1
+  json_serializable: ^6.11.1
