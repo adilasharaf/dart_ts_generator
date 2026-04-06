@@ -2,17 +2,17 @@ name: dart_ts_generator_example
 description: Example models for dart_ts_generator
 
 environment:
-  sdk: ">=3.0.0 <4.0.0"
+  sdk: ">=3.10.0 <4.0.0"
 
 dependencies:
-  cloud_firestore: ^4.17.0
-  json_annotation: ^4.9.0
+  build_runner: ^2.13.1
+  cloud_firestore: ^6.2.0
+  json_annotation: ^4.11.0
 
 dev_dependencies:
-  build_runner: ^2.4.9
-  json_serializable: ^6.8.0
   dart_ts_generator:
     path: ../
+  json_serializable: ^6.13.1
 
 targets:
   $default:

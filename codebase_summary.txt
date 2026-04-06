@@ -1,0 +1,1492 @@
+.
+  pubspec.lock
+  codebase_summary.txt
+  LICENSE
+  example
+  pubspec.yaml
+  lib
+    builder.dart
+    dart_ts_generator.dart
+    generator.dart
+    src
+      annotations.dart
+      cross_file_registry.dart
+      model_analyzer.dart
+      zod_generator.dart
+      source_parser.dart
+      type_mapping.dart
+    index_builder.dart
+  build.yaml
+  code_summary
+  README.md
+  test
+  bin
+
+--- FILE CONTENTS ---
+
+FILE: ./lib/builder.dart
+import 'package:build/build.dart';
+import 'package:source_gen/source_gen.dart';
+import 'generator.dart';
+
+/// Builder factory called by build_runner.
+Builder dartTsGeneratorBuilder(BuilderOptions options) {
+  return SharedPartBuilder(
+    [DartTsGenerator(options.config)],
+    'dart_ts_generator',
+  );
+}
+
+/// Standalone file-per-file builder (alternative mode).
+Builder dartTsFileBuilder(BuilderOptions options) {
+  return _TsFileBuilder(options.config);
+}
+
+class _TsFileBuilder implements Builder {
+  final Map<String, dynamic> config;
+
+  _TsFileBuilder(this.config);
+
+  @override
+  Map<String, List<String>> get buildExtensions => {
+        '.dart': ['.g.ts'],
+      };
+
+  @override
+  Future<void> build(BuildStep buildStep) async {
+    final inputId = buildStep.inputId;
+    final library = await buildStep.inputLibrary;
+
+    final generator = DartTsGenerator(config);
+    final output = await generator.generateForLibrary(library, buildStep);
+
+    if (output == null || output.trim().isEmpty) return;
+
+    final outputId = inputId.changeExtension('.g.ts');
+    await buildStep.writeAsString(outputId, output);
+  }
+}
+
+--- END FILE ---
+
+FILE: ./lib/dart_ts_generator.dart
+/// Dart to TypeScript/Zod schema generator using build_runner
+library dart_ts_generator;
+
+export 'src/annotations.dart';
+export 'src/cross_file_registry.dart';
+export 'src/model_analyzer.dart';
+export 'src/source_parser.dart';
+export 'src/type_mapping.dart';
+export 'src/zod_generator.dart';
+export 'builder.dart';
+export 'generator.dart';
+
+--- END FILE ---
+
+FILE: ./lib/generator.dart
+import 'dart:async';
+
+import 'package:analyzer/dart/element/element.dart';
+import 'package:build/build.dart';
+import 'package:path/path.dart' as p;
+import 'package:source_gen/source_gen.dart';
+
+import 'src/model_analyzer.dart';
+import 'src/zod_generator.dart';
+
+class DartTsGenerator extends Generator {
+  final Map<String, dynamic> config;
+
+  DartTsGenerator(this.config);
+
+  final _jsonSerializableChecker = TypeChecker.typeNamedLiterally(
+    'JsonSerializable',
+    inPackage: 'json_annotation',
+  );
+
+  final _tsGenerateChecker = TypeChecker.typeNamedLiterally(
+    'TsGenerate',
+    inPackage: 'dart_ts_generator',
+  );
+
+  @override
+  FutureOr<String?> generate(LibraryReader library, BuildStep buildStep) async {
+    final tsContent = await generateForLibrary(library.element, buildStep);
+    if (tsContent == null || tsContent.trim().isEmpty) return null;
+
+    // ── KEY FIX 1: Write the .g.ts file directly, bypassing source_gen's
+    //   Dart formatter entirely. We construct the output AssetId manually
+    //   so we control both the extension AND the output directory.
+    final outputDir = config['output_dir'] as String? ?? 'lib/generated/ts';
+
+    // e.g. lib/models/ei_user.dart → ei_user
+    final baseName = p.basenameWithoutExtension(buildStep.inputId.path);
+
+    final outputId = AssetId(
+      buildStep.inputId.package,
+      '$outputDir/$baseName.g.ts', // e.g. lib/generated/ts/ei_user.g.ts
+    );
+
+    await buildStep.writeAsString(outputId, tsContent);
+
+    // ── KEY FIX 2: Return null so source_gen does NOT try to write or
+    //   format anything itself. If we returned a string here, source_gen
+    //   would pipe it through `dart format` and write a .g.dart part —
+    //   both of which are wrong for TypeScript output.
+    return null;
+  }
+
+  Future<String?> generateForLibrary(
+    LibraryElement library,
+    BuildStep buildStep,
+  ) async {
+    final generatorConfig = GeneratorConfig.fromMap(config);
+
+    final allClasses = _collectClasses(library);
+    if (allClasses.isEmpty) return null;
+
+    final knownModelNames = allClasses.map((c) => c.name!).toSet();
+    final knownEnumNames = allClasses
+        .whereType<EnumElement>()
+        .map((c) => c.name!)
+        .toSet();
+
+    final analyzer = ModelAnalyzer(
+      knownModelNames: knownModelNames,
+      knownEnumNames: knownEnumNames,
+    );
+
+    final classInfos = <ClassInfo>[];
+    for (final cls in allClasses) {
+      try {
+        if (cls is EnumElement) {
+          classInfos.add(_analyzeEnum(cls));
+        } else if (cls is ClassElement) {
+          if (!_shouldGenerate(cls)) continue;
+          classInfos.add(analyzer.analyzeClass(cls));
+        }
+      } catch (e) {
+        log.warning('dart_ts_generator: failed to analyze ${cls.name}: $e');
+      }
+    }
+
+    if (classInfos.isEmpty) return null;
+
+    final registry = {for (final c in classInfos) c.name!: c};
+
+    final zodGen = ZodSchemaGenerator(
+      classRegistry: registry,
+      config: generatorConfig,
+    );
+
+    return zodGen.generateFile(classInfos);
+  }
+
+  List<InterfaceElement> _collectClasses(LibraryElement library) {
+    final result = <InterfaceElement>[];
+    for (final element in library.children) {
+      if (element is EnumElement) result.add(element);
+      if (element is ClassElement) result.add(element);
+      if (element is MixinElement) result.add(element);
+    }
+    return result;
+  }
+
+  bool _shouldGenerate(ClassElement cls) {
+    if (cls.name!.startsWith('_')) return false;
+    if (_jsonSerializableChecker.hasAnnotationOf(cls)) return true;
+    if (_tsGenerateChecker.hasAnnotationOf(cls)) return true;
+    final superName = cls.supertype?.element.name;
+    if (superName != null &&
+        superName != 'Object' &&
+        !superName.startsWith('_')) {
+      return true;
+    }
+    return false;
+  }
+
+  ClassInfo _analyzeEnum(EnumElement element) {
+    final values = element.fields
+        .where((f) => f.isEnumConstant)
+        .map((f) => f.name)
+        .toList();
+
+    return ClassInfo(
+      name: element.name,
+      fields: [],
+      isEnum: true,
+      enumValues: values,
+      isAbstract: false,
+    );
+  }
+}
+
+--- END FILE ---
+
+FILE: ./lib/src/annotations.dart
+/// Annotations for controlling TypeScript generation behavior.
+
+/// Marks a field to be ignored during TypeScript generation.
+class TsIgnore {
+  const TsIgnore();
+}
+
+/// Overrides the TypeScript type for a field.
+/// Example:
+/// ```dart
+/// @TsType('string | number')
+/// dynamic myField;
+/// ```
+class TsType {
+  final String typeName;
+  final String? zodSchema;
+  const TsType(this.typeName, {this.zodSchema});
+}
+
+/// Marks a class for TypeScript generation.
+/// By default any class with @JsonSerializable is picked up automatically.
+class TsGenerate {
+  const TsGenerate();
+}
+
+/// Marks a class as a Firestore document model.
+/// Adds special handling for Timestamp, GeoPoint, etc.
+class TsFirestoreModel {
+  const TsFirestoreModel();
+}
+
+--- END FILE ---
+
+FILE: ./lib/src/cross_file_registry.dart
+/// Tracks which schemas are defined in which files so the generator
+/// can emit correct `import` statements when referencing cross-file types.
+///
+/// Example:
+///   EiModel is defined in ei_model.dart → generates ei_model.g.ts
+///   EiUser extends EiModel (in ei_user.dart) → needs:
+///     import { EiModelSchema } from './ei_model.g';
+library;
+
+import 'package:path/path.dart' as p;
+
+/// Holds a registry of [typeName → sourceFile] mappings accumulated
+/// across an entire build run.
+class CrossFileRegistry {
+  /// Map from class/enum name → the .g.ts file path (relative to output root)
+  final Map<String, String> _typeToFile = {};
+
+  /// Map from .g.ts file → list of type names defined there
+  final Map<String, List<String>> _fileToTypes = {};
+
+  void registerTypes(String outputFilePath, List<String> typeNames) {
+    for (final name in typeNames) {
+      _typeToFile[name] = outputFilePath;
+    }
+    _fileToTypes[outputFilePath] = typeNames;
+  }
+
+  /// Returns the output file path where [typeName] is defined,
+  /// or null if it's defined in the same file (no import needed).
+  String? fileForType(String typeName) => _typeToFile[typeName];
+
+  /// Given the current file and a referenced type, return the relative
+  /// import path (without extension), or null if same-file.
+  String? importPathFor(String currentFile, String referencedType) {
+    final targetFile = _typeToFile[referencedType];
+    if (targetFile == null || targetFile == currentFile) return null;
+
+    final currentDir = p.dirname(currentFile);
+    var rel = p.relative(targetFile, from: currentDir);
+
+    // Remove .ts extension for TS imports
+    if (rel.endsWith('.ts')) {
+      rel = rel.substring(0, rel.length - 3);
+    }
+
+    // Ensure ./ prefix
+    if (!rel.startsWith('.')) rel = './$rel';
+
+    return rel;
+  }
+
+  bool hasType(String name) => _typeToFile.containsKey(name);
+}
+
+/// Generates an `index.ts` barrel file that re-exports all generated schemas.
+class IndexBarrelGenerator {
+  static String generate(List<String> outputFiles, String indexFilePath) {
+    final buf = StringBuffer();
+    buf.writeln('// AUTO-GENERATED by dart_ts_generator. DO NOT EDIT.');
+    buf.writeln('// Barrel re-export of all generated schemas.');
+    buf.writeln();
+
+    final indexDir = p.dirname(indexFilePath);
+
+    for (final file in outputFiles) {
+      var rel = p.relative(file, from: indexDir);
+      if (rel.endsWith('.ts')) rel = rel.substring(0, rel.length - 3);
+      if (!rel.startsWith('.')) rel = './$rel';
+      buf.writeln("export * from '$rel';");
+    }
+
+    return buf.toString();
+  }
+}
+
+/// Generates cross-file import headers for a single output file.
+class ImportHeaderGenerator {
+  static String generate({
+    required String currentFile,
+    required List<String> referencedTypes,
+    required CrossFileRegistry registry,
+    required String zodImport,
+  }) {
+    final buf = StringBuffer();
+    buf.writeln("import { z } from '$zodImport';");
+
+    // Group referenced types by their source file
+    final importMap = <String, List<String>>{};
+
+    for (final type in referencedTypes) {
+      final importPath = registry.importPathFor(currentFile, type);
+      if (importPath != null) {
+        importMap.putIfAbsent(importPath, () => []).add('${type}Schema');
+      }
+    }
+
+    for (final entry in importMap.entries.toList()..sort((a, b) => a.key.compareTo(b.key))) {
+      final symbols = entry.value.join(', ');
+      buf.writeln("import { $symbols } from '${entry.key}';");
+    }
+
+    return buf.toString();
+  }
+}
+
+--- END FILE ---
+
+FILE: ./lib/src/model_analyzer.dart
+import 'package:analyzer/dart/element/element.dart';
+import 'package:analyzer/dart/element/type.dart';
+import 'package:analyzer/dart/element/nullability_suffix.dart';
+import 'package:analyzer/dart/constant/value.dart';
+import 'package:dart_ts_generator/dart_ts_generator.dart';
+
+/// Represents a parsed Dart field ready for code generation.
+class FieldInfo {
+  final String? dartName;
+  final String tsName; // from @JsonKey(name:...)
+  final String? dartTypeName;
+  final List<String?> typeArgs;
+  final bool isNullable;
+  final bool isIgnored; // @TsIgnore or @JsonKey(ignore: true)
+  final String? converterClass; // e.g. 'DateTimeNullableConverter'
+  final String? defaultValue; // raw Dart literal
+  final String? fromJson; // custom fromJson function name
+  final String? toJson; // custom toJson function name
+  final bool isEnum;
+  final bool isList;
+  final bool isMap;
+  final bool isModel; // refers to another model class
+
+  const FieldInfo({
+    this.dartName,
+    required this.tsName,
+    this.dartTypeName,
+    required this.typeArgs,
+    required this.isNullable,
+    required this.isIgnored,
+    this.converterClass,
+    this.defaultValue,
+    this.fromJson,
+    this.toJson,
+    required this.isEnum,
+    required this.isList,
+    required this.isMap,
+    required this.isModel,
+  });
+}
+
+/// Represents a parsed Dart class (model or enum).
+class ClassInfo {
+  final String? name;
+  final String? superclassName; // direct parent (if not Object)
+  final List<FieldInfo> fields;
+  final bool isEnum;
+  final List<String?> enumValues;
+  final bool isAbstract;
+
+  const ClassInfo({
+    this.name,
+    this.superclassName,
+    required this.fields,
+    required this.isEnum,
+    required this.enumValues,
+    required this.isAbstract,
+  });
+}
+
+/// Parses Dart [ClassElement] into [ClassInfo].
+class ModelAnalyzer {
+  /// Set of known model names in the current library (for isModel detection)
+  final Set<String> knownModelNames;
+
+  /// Set of known enum names
+  final Set<String> knownEnumNames;
+
+  /// Cache of constructor defaults per class (populated lazily from source)
+  final Map<String, Map<String, String>> _constructorDefaultsCache = {};
+
+  ModelAnalyzer({
+    required this.knownModelNames,
+    required this.knownEnumNames,
+  });
+
+  ClassInfo analyzeClass(ClassElement element) {
+    if (element is EnumElement) {
+      return _analyzeEnum(element);
+    }
+    return _analyzeModel(element);
+  }
+
+  ClassInfo _analyzeEnum(ClassElement element) {
+    final values = element.fields
+        .where((f) => f.isEnumConstant)
+        .map((f) => f.name)
+        .toList();
+    return ClassInfo(
+      name: element.name,
+      fields: [],
+      isEnum: true,
+      enumValues: values,
+      isAbstract: false,
+    );
+  }
+
+  ClassInfo _analyzeModel(ClassElement element) {
+    final superName = _resolveSuperclass(element);
+    final fields = <FieldInfo>[];
+
+    for (final field in element.fields) {
+      final getter = field.getter;
+
+      // Skip synthetic-like fields
+      if (getter == null || getter.isAbstract) continue;
+
+      final info = _analyzeField(field);
+      if (info != null) fields.add(info);
+    }
+
+    return ClassInfo(
+      name: element.name,
+      superclassName: superName,
+      fields: fields,
+      isEnum: false,
+      enumValues: [],
+      isAbstract: element.isAbstract,
+    );
+  }
+
+  String? _resolveSuperclass(ClassElement element) {
+    final supertype = element.supertype;
+    if (supertype == null) return null;
+    final name = supertype.element.name;
+    if (name == 'Object' || name == 'dynamic') return null;
+    return name;
+  }
+
+  FieldInfo? _analyzeField(FieldElement field) {
+    // Check for @TsIgnore
+    if (_hasAnnotation(field, 'TsIgnore')) return null;
+
+    // Parse @JsonKey annotation
+    final jsonKey = _getAnnotation(field, 'JsonKey');
+    bool isIgnored = false;
+    String? jsonName;
+    String? defaultValue;
+    String? fromJson;
+    String? toJson;
+
+    if (jsonKey != null) {
+      // In newer json_annotation, 'ignore' was split into includeFromJson /
+      // includeToJson. Support both the legacy 'ignore' field and the newer ones.
+      final legacyIgnore = _getBoolField(jsonKey, 'ignore') ?? false;
+      final includeFromJson = _getBoolField(jsonKey, 'includeFromJson') ?? true;
+      final includeToJson = _getBoolField(jsonKey, 'includeToJson') ?? true;
+
+      if (legacyIgnore || (!includeFromJson && !includeToJson)) {
+        isIgnored = true;
+      }
+
+      jsonName = _getStringField(jsonKey, 'name');
+      defaultValue = _getDefaultValueLiteral(jsonKey);
+      fromJson = _getFunctionName(jsonKey, 'fromJson');
+      toJson = _getFunctionName(jsonKey, 'toJson');
+    }
+
+    if (isIgnored) return null;
+
+    // Check for converter annotation on the field
+    final converterClass = _detectConverter(field);
+
+    // Parse type
+    final typeInfo = _parseType(field.type);
+
+    // Determine default from constructor if not from @JsonKey
+    final constructorDefault = defaultValue ?? _getConstructorDefault(field);
+
+    return FieldInfo(
+      dartName: field.name,
+      tsName: jsonName ?? _camelToSnakeOrKeep(field.name),
+      dartTypeName: typeInfo.typeName,
+      typeArgs: typeInfo.typeArgs,
+      isNullable: typeInfo.isNullable,
+      isIgnored: false,
+      converterClass: converterClass,
+      defaultValue: constructorDefault,
+      fromJson: fromJson,
+      toJson: toJson,
+      isEnum: knownEnumNames.contains(typeInfo.typeName),
+      isList: typeInfo.typeName == 'List' || typeInfo.typeName == 'Iterable',
+      isMap: typeInfo.typeName == 'Map',
+      isModel: _isModelType(typeInfo.typeName),
+    );
+  }
+
+  _TypeInfo _parseType(DartType type) {
+    // analyzer >=6.x: nullabilitySuffix is a proper enum; compare directly.
+    final isNullable = type.nullabilitySuffix == NullabilitySuffix.question;
+
+    if (type is InterfaceType) {
+      final name = type.element.name;
+      final args =
+          type.typeArguments.map((a) => _parseType(a).typeName).toList();
+      return _TypeInfo(name, isNullable, args);
+    }
+
+    // Fallback for other types (TypeParameterType, FunctionType, etc.)
+    final name =
+        type.element?.name ?? type.getDisplayString().replaceAll('?', '');
+    return _TypeInfo(name, isNullable, []);
+  }
+
+  bool _isModelType(String? typeName) {
+    return knownModelNames.contains(typeName) &&
+        !knownEnumNames.contains(typeName);
+  }
+
+  String? _detectConverter(FieldElement field) {
+    // analyzer >=6.x: field.metadata is List<ElementAnnotation> directly.
+    for (final metadata in field.metadata.annotations) {
+      final element = metadata.element;
+      if (element == null) continue;
+
+      String? className;
+      if (element is ConstructorElement) {
+        // analyzer >=6.x: enclosingElement3 replaces enclosingElement for
+        // named-type lookups; falls back gracefully if not available.
+        className = (element.enclosingElement as InterfaceElement?)?.name ??
+            element.enclosingElement.name;
+      } else if (element is PropertyAccessorElement) {
+        className = element.returnType.element?.name;
+      }
+
+      if (className != null && _looksLikeConverter(className)) {
+        return className;
+      }
+    }
+    return null;
+  }
+
+  bool _looksLikeConverter(String name) {
+    final lower = name.toLowerCase();
+    return lower.contains('converter') ||
+        lower.contains('transformer') ||
+        lower.contains('serializer');
+  }
+
+  bool _hasAnnotation(FieldElement field, String annotationName) {
+    // analyzer >=6.x: field.metadata is List<ElementAnnotation> directly.
+    return field.metadata.annotations.any((m) {
+      final element = m.element;
+      if (element is ConstructorElement) {
+        final enclosing = element.enclosingElement as InterfaceElement?;
+        return (enclosing?.name ?? element.enclosingElement.name) ==
+            annotationName;
+      }
+      if (element is PropertyAccessorElement) {
+        return element.name == annotationName;
+      }
+      return false;
+    });
+  }
+
+  ElementAnnotation? _getAnnotation(FieldElement field, String name) {
+    for (final meta in field.metadata.annotations) {
+      final element = meta.element;
+      String? className;
+      if (element is ConstructorElement) {
+        final enclosing = element.enclosingElement as InterfaceElement?;
+        className = enclosing?.name ?? element.enclosingElement.name;
+      } else if (element is PropertyAccessorElement) {
+        className = element.name;
+      }
+      if (className == name) return meta;
+    }
+    return null;
+  }
+
+  bool? _getBoolField(ElementAnnotation annotation, String fieldName) {
+    try {
+      final value = annotation.computeConstantValue();
+      final field = value?.getField(fieldName);
+      return field?.toBoolValue();
+    } catch (_) {
+      return null;
+    }
+  }
+
+  String? _getStringField(ElementAnnotation annotation, String fieldName) {
+    try {
+      final value = annotation.computeConstantValue();
+      return value?.getField(fieldName)?.toStringValue();
+    } catch (_) {
+      return null;
+    }
+  }
+
+  String? _getDefaultValueLiteral(ElementAnnotation annotation) {
+    try {
+      final value = annotation.computeConstantValue();
+      final defaultField = value?.getField('defaultValue');
+      if (defaultField == null || defaultField.isNull) return null;
+      return _dartObjectToLiteral(defaultField);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  String? _dartObjectToLiteral(DartObject obj) {
+    if (obj.isNull) return null;
+    final boolVal = obj.toBoolValue();
+    if (boolVal != null) return boolVal.toString();
+    final intVal = obj.toIntValue();
+    if (intVal != null) return intVal.toString();
+    final doubleVal = obj.toDoubleValue();
+    if (doubleVal != null) return doubleVal.toString();
+    final stringVal = obj.toStringValue();
+    if (stringVal != null) return '"$stringVal"';
+    final listVal = obj.toListValue();
+    if (listVal != null) {
+      if (listVal.isEmpty) return '[]';
+      final items = listVal.map((e) => _dartObjectToLiteral(e) ?? 'null');
+      return '[${items.join(', ')}]';
+    }
+    final mapVal = obj.toMapValue();
+    if (mapVal != null && mapVal.isEmpty) return '{}';
+
+    // Enum value: get the field name
+    final variable =
+        obj.variable; // analyzer >=6.x: variable2 replaces variable
+    if (variable != null) {
+      return '"${variable.name}"';
+    }
+    return null;
+  }
+
+  String? _getFunctionName(ElementAnnotation annotation, String fieldName) {
+    try {
+      final value = annotation.computeConstantValue();
+      final fn = value?.getField(fieldName);
+      // Functions can't really be evaluated as constants, but we detect presence
+      if (fn != null && !fn.isNull) return '__custom__';
+      return null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  String? _getConstructorDefault(FieldElement field) {
+    try {
+      final cls = field.enclosingElement;
+      if (cls is! ClassElement) return null;
+
+      // Lazy-load defaults from source for this class
+      if (!_constructorDefaultsCache.containsKey(cls.name)) {
+        _constructorDefaultsCache[cls.name!] = _loadDefaultsForClass(cls);
+      }
+
+      final defaults = _constructorDefaultsCache[cls.name]!;
+      final raw = defaults[field.name];
+      if (raw == null) return null;
+
+      return TypeMapping.resolveLiteralDefault(raw);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Map<String, String> _loadDefaultsForClass(ClassElement cls) {
+    try {
+      final fragment = cls.firstFragment;
+      final source = fragment.libraryFragment.source;
+
+      final fullSource = source.contents.data;
+
+      final offset = fragment.nameOffset ?? 0;
+      final nameLength = cls.name!.length;
+      final end = offset + nameLength + 2000;
+
+      final classSlice = fullSource.substring(
+        offset.clamp(0, fullSource.length),
+        end.clamp(0, fullSource.length),
+      );
+
+      final ctorDefaults = ConstructorDefaultExtractor.extract(classSlice);
+      final fieldDefaults = FieldInitializerExtractor.extract(classSlice);
+
+      return {...fieldDefaults, ...ctorDefaults};
+    } catch (_) {
+      return {};
+    }
+  }
+
+  String _camelToSnakeOrKeep(String? name) =>
+      name ?? ''; // json_serializable keeps camelCase by default
+}
+
+class _TypeInfo {
+  final String? typeName;
+  final bool isNullable;
+  final List<String?> typeArgs;
+
+  _TypeInfo(this.typeName, this.isNullable, this.typeArgs);
+}
+
+--- END FILE ---
+
+FILE: ./lib/src/zod_generator.dart
+import 'model_analyzer.dart';
+import 'type_mapping.dart';
+import 'cross_file_registry.dart';
+
+/// Generates TypeScript + Zod schema strings from [ClassInfo] objects.
+class ZodSchemaGenerator {
+  final Map<String, ClassInfo> classRegistry;
+  final GeneratorConfig config;
+  final CrossFileRegistry? crossFileRegistry;
+  final String? currentOutputFile;
+
+  ZodSchemaGenerator({
+    required this.classRegistry,
+    required this.config,
+    this.crossFileRegistry,
+    this.currentOutputFile,
+  });
+
+  /// Generate full TS output for a list of classes.
+  String generateFile(List<ClassInfo> classes) {
+    final buf = StringBuffer();
+
+    // Separate enums and models, preserve declaration order
+    final enums = classes.where((c) => c.isEnum).toList();
+    final models = classes.where((c) => !c.isEnum).toList();
+    final sorted = _topologicalSort(models);
+
+    // Collect all external type references for cross-file imports
+    final externalRefs = _collectExternalTypeRefs(classes);
+
+    // Header
+    buf.writeln('// AUTO-GENERATED by dart_ts_generator. DO NOT EDIT.');
+    buf.writeln('// Generated at: ${DateTime.now().toIso8601String()}');
+    buf.writeln();
+
+    // Zod + cross-file imports
+    if (crossFileRegistry != null &&
+        currentOutputFile != null &&
+        externalRefs.isNotEmpty) {
+      buf.writeln(ImportHeaderGenerator.generate(
+        currentFile: currentOutputFile!,
+        referencedTypes: externalRefs.toList(),
+        registry: crossFileRegistry!,
+        zodImport: config.zodImport,
+      ));
+    } else {
+      buf.writeln("import { z } from '${config.zodImport}';");
+    }
+    buf.writeln();
+
+    // Enums first
+    for (final e in enums) {
+      buf.writeln(_generateEnum(e));
+    }
+
+    if (enums.isNotEmpty) buf.writeln();
+
+    // Models
+    for (final m in sorted) {
+      if (m.isAbstract && m.fields.isEmpty) continue;
+      buf.writeln(_generateModel(m));
+    }
+
+    return buf.toString();
+  }
+
+  /// Collect type names that are referenced but NOT defined in [classes].
+  Set<String> _collectExternalTypeRefs(List<ClassInfo> classes) {
+    final localNames = classes.map((c) => c.name).toSet();
+    final refs = <String>{};
+
+    for (final cls in classes) {
+      if (cls.superclassName != null &&
+          !localNames.contains(cls.superclassName)) {
+        refs.add(cls.superclassName!);
+      }
+      for (final field in cls.fields) {
+        final typeName = field.dartTypeName;
+        if (!localNames.contains(typeName)) {
+          if (field.isModel || field.isEnum) refs.add(typeName!);
+          // Also check list inner types
+          for (final arg in field.typeArgs) {
+            if (classRegistry.containsKey(arg) && !localNames.contains(arg)) {
+              refs.add(arg!);
+            }
+          }
+        }
+      }
+    }
+
+    return refs;
+  }
+
+  String _generateEnum(ClassInfo info) {
+    final values = info.enumValues.map((v) => '"$v"').join(', ');
+    return '''export const ${info.name}Schema = z.enum([$values]);
+export type ${info.name} = z.infer<typeof ${info.name}Schema>;
+''';
+  }
+
+  String _generateModel(ClassInfo info) {
+    final buf = StringBuffer();
+    final schemaName = '${info.name}Schema';
+
+    final parent = info.superclassName;
+    final hasParent = parent != null &&
+        (classRegistry.containsKey(parent) ||
+            (crossFileRegistry?.hasType(parent) ?? false));
+
+    if (hasParent) {
+      buf.writeln('export const $schemaName = ${parent}Schema.extend({');
+    } else {
+      buf.writeln('export const $schemaName = z.object({');
+    }
+
+    for (final field in info.fields) {
+      final zodExpr = _generateFieldZod(field);
+      // Multi-line expressions get extra indent, single-line stay inline
+      if (zodExpr.contains('\n')) {
+        buf.writeln('  ${field.tsName}:');
+        for (final line in zodExpr.split('\n')) {
+          buf.writeln('    $line');
+        }
+        // Remove trailing comma from last line and add it at field level
+        final lines = buf.toString().trimRight().split('\n');
+        final last = lines.removeLast();
+        buf.clear();
+        buf.writeln(lines.join('\n'));
+        buf.writeln('$last,');
+      } else {
+        buf.writeln('  ${field.tsName}: $zodExpr,');
+      }
+    }
+
+    buf.writeln('});');
+    buf.writeln();
+    buf.writeln('export type ${info.name} = z.infer<typeof $schemaName>;');
+    buf.writeln();
+
+    return buf.toString();
+  }
+
+  String _generateFieldZod(FieldInfo field) {
+    if (field.fromJson != null || field.toJson != null) {
+      // Custom fromJson/toJson → treat as z.any()
+      final base = field.isNullable ? 'z.any().optional()' : 'z.any()';
+      if (field.defaultValue != null) {
+        return '$base.default(${field.defaultValue})';
+      }
+      return base;
+    }
+
+    if (field.converterClass != null) {
+      return _generateConverterZod(field);
+    }
+
+    return _generateTypeZod(field);
+  }
+
+  String _generateConverterZod(FieldInfo field) {
+    final converter = field.converterClass!;
+    String schema;
+
+    // Check known converters
+    ConverterTransform? transform;
+    for (final entry in TypeMapping.knownConverters.entries) {
+      if (converter.toLowerCase().contains(entry.key.toLowerCase())) {
+        transform = entry.value;
+        break;
+      }
+    }
+
+    if (transform != null) {
+      if (transform.isList || field.isList) {
+        schema = '''z.array(
+    z.any().transform(${transform.transform})
+  )''';
+      } else {
+        schema = 'z.any().transform(${transform.transform})';
+      }
+    } else if (_isDateTimeConverter(converter)) {
+      final nullable = converter.toLowerCase().contains('nullable');
+      final t = nullable
+          ? TypeMapping.knownConverters['DateTimeNullableConverter']!.transform
+          : TypeMapping.knownConverters['DateTimeConverter']!.transform;
+      schema = 'z.any().transform($t)';
+    } else {
+      schema = 'z.any()';
+    }
+
+    if (field.isNullable) schema = '$schema.optional()';
+    if (field.defaultValue != null)
+      schema = '$schema.default(${field.defaultValue})';
+
+    return schema;
+  }
+
+  bool _isDateTimeConverter(String cls) {
+    final lower = cls.toLowerCase();
+    return lower.contains('datetime') || lower.contains('timestamp');
+  }
+
+  String _generateTypeZod(FieldInfo field) {
+    String schema;
+
+    if (field.isList) {
+      schema = _generateListZod(field);
+    } else if (field.isMap) {
+      schema = _generateMapZod(field);
+    } else if (field.isEnum) {
+      schema = '${field.dartTypeName}Schema';
+    } else if (field.isModel) {
+      schema = '${field.dartTypeName}Schema';
+    } else {
+      schema = _resolveScalarZod(field.dartTypeName!);
+    }
+
+    if (field.isNullable) {
+      schema = '$schema.optional()';
+    }
+
+    if (field.defaultValue != null) {
+      schema = '$schema.default(${field.defaultValue})';
+    }
+
+    return schema;
+  }
+
+  String _generateListZod(FieldInfo field) {
+    if (field.typeArgs.isEmpty) return 'z.array(z.unknown())';
+
+    final innerType = field.typeArgs[0];
+
+    // Check if inner type is an enum or model
+    if (classRegistry.containsKey(innerType)) {
+      final innerInfo = classRegistry[innerType]!;
+      if (innerInfo.isEnum) {
+        return 'z.array(${innerType}Schema)';
+      }
+      return 'z.array(${innerType}Schema)';
+    }
+
+    final innerZod = _resolveScalarZod(innerType!);
+    return 'z.array($innerZod)';
+  }
+
+  String _generateMapZod(FieldInfo field) {
+    if (field.typeArgs.length < 2) return 'z.record(z.unknown())';
+    final valueType = field.typeArgs[1];
+    final valueZod = classRegistry.containsKey(valueType)
+        ? '${valueType}Schema'
+        : _resolveScalarZod(valueType!);
+    return 'z.record($valueZod)';
+  }
+
+  String _resolveScalarZod(String typeName) {
+    if (TypeMapping.primitiveZodMap.containsKey(typeName)) {
+      return TypeMapping.primitiveZodMap[typeName]!;
+    }
+    if (TypeMapping.timestampTypes.contains(typeName)) {
+      return r'''z.any().transform((val) =>
+    val?.toDate ? val.toDate() : typeof val === "number" ? new Date(val) : val)''';
+    }
+    if (TypeMapping.opaqueFirestoreTypes.contains(typeName)) {
+      return 'z.any()';
+    }
+    if (TypeMapping.firestoreZodMap.containsKey(typeName)) {
+      return TypeMapping.firestoreZodMap[typeName]!;
+    }
+    // Unknown type → assume schema reference
+    return '${typeName}Schema';
+  }
+
+  /// Topologically sort models so base classes come before derived ones.
+  List<ClassInfo> _topologicalSort(List<ClassInfo> models) {
+    final nameMap = {for (final m in models) m.name: m};
+    final result = <ClassInfo>[];
+    final visited = <String>{};
+
+    void visit(ClassInfo cls) {
+      if (visited.contains(cls.name)) return;
+      visited.add(cls.name!);
+      if (cls.superclassName != null &&
+          nameMap.containsKey(cls.superclassName)) {
+        visit(nameMap[cls.superclassName]!);
+      }
+      result.add(cls);
+    }
+
+    for (final m in models) {
+      visit(m);
+    }
+
+    return result;
+  }
+}
+
+class GeneratorConfig {
+  final String outputDir;
+  final bool generateIndex;
+  final String zodImport;
+  final bool firestoreTransforms;
+  final bool nullSafety;
+
+  const GeneratorConfig({
+    this.outputDir = 'lib/generated/ts',
+    this.generateIndex = true,
+    this.zodImport = 'zod',
+    this.firestoreTransforms = true,
+    this.nullSafety = true,
+  });
+
+  factory GeneratorConfig.fromMap(Map<String, dynamic> map) {
+    return GeneratorConfig(
+      outputDir: map['output_dir'] as String? ?? 'lib/generated/ts',
+      generateIndex: map['generate_index'] as bool? ?? true,
+      zodImport: map['zod_import'] as String? ?? 'zod',
+      firestoreTransforms: map['firestore_transforms'] as bool? ?? true,
+      nullSafety: map['null_safety'] as bool? ?? true,
+    );
+  }
+}
+
+--- END FILE ---
+
+FILE: ./lib/src/source_parser.dart
+/// Extracts constructor default values by parsing the raw Dart source text.
+///
+/// The analyzer's element model does NOT expose initializer expressions
+/// as structured data for non-const values (e.g. `= []`, `= 0.0`).
+/// We solve this by doing a targeted regex parse on the source text of
+/// the constructor parameter list.
+library;
+
+/// Parses a Dart class source to extract constructor parameter defaults.
+///
+/// Returns a map of { fieldName → dartLiteralString }.
+///
+/// Example input (constructor body):
+///   ```dart
+///   MyModel({
+///     this.count = 0,
+///     this.tags = const [],
+///     this.name,
+///     this.status = MyStatus.active,
+///   });
+///   ```
+///
+/// Returns: { 'count': '0', 'tags': '[]', 'status': 'MyStatus.active' }
+class ConstructorDefaultExtractor {
+  static Map<String, String> extract(String classSource) {
+    final result = <String, String>{};
+
+    // Find the constructor body: ClassName({ ... })
+    // We look for the primary constructor (unnamed).
+    final constructorPattern = RegExp(
+      r'\w+\s*\(\s*\{([^}]*)\}',
+      dotAll: true,
+    );
+
+    final match = constructorPattern.firstMatch(classSource);
+    if (match == null) return result;
+
+    final paramBlock = match.group(1) ?? '';
+
+    // Match each `this.fieldName = defaultValue` pattern
+    // Handles: = 0, = 0.0, = [], = {}, = true, = false, = Enum.value, = 'str', = "str", = const []
+    final paramPattern = RegExp(
+      r'this\.(\w+)\s*=\s*(const\s+)?([^\s,\n]+(?:\s*\.\s*\w+)?)',
+      dotAll: false,
+    );
+
+    for (final m in paramPattern.allMatches(paramBlock)) {
+      final fieldName = m.group(1)!;
+      final value = m.group(3)!.trim();
+
+      // Skip super. parameters
+      if (value.startsWith('super.')) continue;
+
+      result[fieldName] = _normalizeLiteral(value);
+    }
+
+    return result;
+  }
+
+  /// Normalize a Dart literal to a TypeScript-compatible default expression.
+  static String _normalizeLiteral(String dartLiteral) {
+    // Remove trailing punctuation that may have been captured
+    var val = dartLiteral.replaceAll(RegExp(r'[,;]$'), '').trim();
+
+    // const [] → []
+    // const {} → {}
+    val = val.replaceAll('const ', '');
+
+    return val;
+  }
+}
+
+/// Extracts field-level initializer defaults (non-constructor).
+///
+/// Handles patterns like:
+///   ```dart
+///   double kmsDriven = 0;
+///   List<String> tags = [];
+///   bool isActive = true;
+///   ```
+class FieldInitializerExtractor {
+  static Map<String, String> extract(String classSource) {
+    final result = <String, String>{};
+
+    // Match: Type fieldName = value;
+    // We're careful not to match inside constructors or methods.
+    // Pattern: word boundary, optional generic, space, fieldName, space, =, space, value, ;
+    final pattern = RegExp(
+      r'(?:^|\n)\s*(?:final\s+)?(?:[\w<>, ?]+\s+)(\w+)\s*=\s*([^;{]+);',
+      multiLine: true,
+    );
+
+    for (final m in pattern.allMatches(classSource)) {
+      final fieldName = m.group(1)!.trim();
+      final value = m.group(2)!.trim();
+
+      // Skip obvious non-field lines (methods, etc.)
+      if (fieldName.isEmpty || value.contains('(') && !value.contains(')')) {
+        continue;
+      }
+      // Skip if it looks like a method call (not a literal)
+      if (_isComplexExpression(value)) continue;
+
+      result[fieldName] = value;
+    }
+
+    return result;
+  }
+
+  static bool _isComplexExpression(String val) {
+    // .trim() ensures that " true " is still seen as a simple literal.
+    final trimmed = val.trim();
+
+    // Updated Regex:
+    // 1. ^-?\d+\.?\d*$ -> Handles negative numbers and decimals.
+    // 2. r'["\'].*?["\']' -> More robust string matching.
+    // 3. \w+ -> Simple identifiers (no dots, to avoid complex property chaining if desired).
+    final simple = RegExp(r'^(true|false|null|-?\d+\.?\d*|"[^"]*"|' +
+        "'" +
+        r"[^']*'" +
+        r'|\[\]|\{\}|[\w]+)$');
+
+    return !simple.hasMatch(trimmed);
+  }
+}
+
+--- END FILE ---
+
+FILE: ./lib/src/type_mapping.dart
+/// Maps Dart types to TypeScript/Zod equivalents.
+
+class TypeMapping {
+  /// Primitive type map: Dart type name → Zod schema expression
+  static const Map<String, String> primitiveZodMap = {
+    'String': 'z.string()',
+    'int': 'z.number().int()',
+    'double': 'z.number()',
+    'num': 'z.number()',
+    'bool': 'z.boolean()',
+    'dynamic': 'z.any()',
+    'Object': 'z.unknown()',
+    'Map': 'z.record(z.unknown())',
+  };
+
+  /// Firestore special types → Zod schema with transforms
+  static const Map<String, String> firestoreZodMap = {
+    'Timestamp': 'z.any()',
+    'GeoPoint': 'z.any()',
+    'DocumentReference': 'z.any()',
+    'FieldValue': 'z.any()',
+    'Blob': 'z.any()',
+  };
+
+  /// Firestore types that need Timestamp transform
+  static const Set<String> timestampTypes = {'Timestamp'};
+
+  /// Firestore types treated as opaque any
+  static const Set<String> opaqueFirestoreTypes = {
+    'GeoPoint',
+    'DocumentReference',
+    'FieldValue',
+    'Blob',
+  };
+
+  /// Known converter class name patterns → transform logic
+  static const Map<String, ConverterTransform> knownConverters = {
+    'DateTimeConverter': ConverterTransform(
+      zodBase: 'z.any()',
+      transform: r'''(val) =>
+    val?.toDate ? val.toDate() : typeof val === "number" ? new Date(val) : val instanceof Date ? val : new Date(val)''',
+    ),
+    'DateTimeNullableConverter': ConverterTransform(
+      zodBase: 'z.any()',
+      transform: r'''(val) =>
+    val?.toDate ? val.toDate() : typeof val === "number" ? new Date(val) : null''',
+    ),
+    'TimestampConverter': ConverterTransform(
+      zodBase: 'z.any()',
+      transform: r'''(val) =>
+    val?.toDate ? val.toDate() : typeof val === "number" ? new Date(val) : val''',
+    ),
+    'DateTimeListConverter': ConverterTransform(
+      zodBase: 'z.any()',
+      transform: r'''(val) =>
+    val?.toDate ? val.toDate() : typeof val === "number" ? new Date(val) : val''',
+      isList: true,
+    ),
+    'ServerTimestampConverter': ConverterTransform(
+      zodBase: 'z.any()',
+      transform: r'''(val) =>
+    val?.toDate ? val.toDate() : typeof val === "number" ? new Date(val) : val''',
+    ),
+  };
+
+  /// Resolve a Dart type name to a Zod expression.
+  /// [typeName]: bare type name (no nullability)
+  /// [isNullable]: whether the type is nullable
+  /// [typeArgs]: generic type arguments
+  static String resolveZod(
+    String typeName, {
+    bool isNullable = false,
+    List<String> typeArgs = const [],
+    String? converterClass,
+    String? defaultValue,
+    bool isList = false,
+  }) {
+    String schema;
+
+    // Converter takes precedence
+    if (converterClass != null) {
+      schema = _resolveConverter(converterClass, typeArgs, isList);
+    } else if (typeName == 'List' || typeName == 'Iterable') {
+      final inner = typeArgs.isNotEmpty
+          ? resolveZod(typeArgs[0])
+          : 'z.unknown()';
+      schema = 'z.array($inner)';
+    } else if (typeName == 'Map') {
+      final value = typeArgs.length >= 2
+          ? resolveZod(typeArgs[1])
+          : 'z.unknown()';
+      schema = 'z.record($value)';
+    } else if (primitiveZodMap.containsKey(typeName)) {
+      schema = primitiveZodMap[typeName]!;
+    } else if (firestoreZodMap.containsKey(typeName)) {
+      if (timestampTypes.contains(typeName)) {
+        schema = _timestampZod();
+      } else {
+        schema = firestoreZodMap[typeName]!;
+      }
+    } else {
+      // Assume it's a model or enum schema reference
+      schema = '${typeName}Schema';
+    }
+
+    if (isNullable) {
+      schema = '$schema.optional()';
+    }
+
+    if (defaultValue != null) {
+      schema = '$schema.default($defaultValue)';
+    }
+
+    return schema;
+  }
+
+  static String _resolveConverter(
+    String converterClass,
+    List<String> typeArgs,
+    bool isList,
+  ) {
+    // Check known converters (case-insensitive prefix match)
+    for (final entry in knownConverters.entries) {
+      if (converterClass.toLowerCase().contains(entry.key.toLowerCase()) ||
+          _matchesConverterPattern(converterClass, entry.key)) {
+        final transform = entry.value;
+        if (transform.isList || isList) {
+          return 'z.array(\n    z.any().transform(${transform.transform})\n  )';
+        }
+        return 'z.any().transform(${transform.transform})';
+      }
+    }
+
+    // Generic DateTime detection
+    if (_isDateTimeConverter(converterClass)) {
+      final nullable = converterClass.toLowerCase().contains('nullable');
+      return nullable
+          ? 'z.any().transform(${knownConverters['DateTimeNullableConverter']!.transform})'
+          : 'z.any().transform(${knownConverters['DateTimeConverter']!.transform})';
+    }
+
+    // Unknown converter → opaque any
+    return 'z.any()';
+  }
+
+  static bool _matchesConverterPattern(String cls, String pattern) {
+    // Match like DateTimeNullableConverter matches DateTimeNullable
+    final patternBase = pattern.replaceAll('Converter', '').toLowerCase();
+    return cls.toLowerCase().contains(patternBase);
+  }
+
+  static bool _isDateTimeConverter(String cls) {
+    final lower = cls.toLowerCase();
+    return lower.contains('datetime') || lower.contains('timestamp');
+  }
+
+  static String _timestampZod() {
+    return r'''z.any().transform((val) =>
+    val?.toDate ? val.toDate() : typeof val === "number" ? new Date(val) : val)''';
+  }
+
+  /// Resolve a literal default value to its TypeScript representation.
+  static String? resolveLiteralDefault(String dartLiteral) {
+    if (dartLiteral == 'null') return null;
+    if (dartLiteral == 'true' || dartLiteral == 'false') return dartLiteral;
+    if (dartLiteral == '[]') return '[]';
+    if (dartLiteral == '{}') return '{}';
+
+    // Numeric
+    if (RegExp(r'^-?\d+(\.\d+)?$').hasMatch(dartLiteral)) return dartLiteral;
+
+    // String literal
+    if (dartLiteral.startsWith('"') || dartLiteral.startsWith("'")) {
+      return '"${dartLiteral.replaceAll("'", "").replaceAll('"', '')}"';
+    }
+
+    // Enum: e.g. EiAppSource.other → "other"
+    if (dartLiteral.contains('.')) {
+      final parts = dartLiteral.split('.');
+      return '"${parts.last}"';
+    }
+
+    return '"$dartLiteral"';
+  }
+}
+
+class ConverterTransform {
+  final String zodBase;
+  final String transform;
+  final bool isList;
+
+  const ConverterTransform({
+    required this.zodBase,
+    required this.transform,
+    this.isList = false,
+  });
+}
+
+--- END FILE ---
+
+FILE: ./lib/index_builder.dart
+import 'dart:async';
+import 'package:build/build.dart';
+import 'package:glob/glob.dart';
+import 'src/cross_file_registry.dart';
+
+/// A post-build aggregating step that:
+/// 1. Collects all generated .g.ts files
+/// 2. Produces a barrel `index.ts` re-exporting everything
+///
+/// Register in build.yaml as a separate builder with `build_to: source`.
+class TsIndexBuilder implements Builder {
+  final Map<String, dynamic> config;
+
+  TsIndexBuilder(this.config);
+
+  String get outputDir => config['output_dir'] as String? ?? 'lib/generated/ts';
+
+  @override
+  Map<String, List<String>> get buildExtensions => {
+        r'$lib$': ['generated/ts/index.ts'],
+      };
+
+  @override
+  Future<void> build(BuildStep buildStep) async {
+    final generatedFiles = <String>[];
+
+    // Find all .g.ts files in the output directory
+    await for (final input in buildStep.findAssets(
+      Glob('$outputDir/**.g.ts'),
+    )) {
+      generatedFiles.add(input.path);
+    }
+
+    // Also check for .ts files (non-.g.ts pattern used by file builder)
+    await for (final input in buildStep.findAssets(
+      Glob('lib/**.g.ts'),
+    )) {
+      final path = input.path;
+      if (!generatedFiles.contains(path)) {
+        generatedFiles.add(path);
+      }
+    }
+
+    if (generatedFiles.isEmpty) return;
+
+    generatedFiles.sort();
+
+    final outputId = AssetId(
+      buildStep.inputId.package,
+      '$outputDir/index.ts',
+    );
+
+    final content = IndexBarrelGenerator.generate(
+      generatedFiles,
+      outputId.path,
+    );
+
+    await buildStep.writeAsString(outputId, content);
+
+    log.info('dart_ts_generator: wrote index.ts with ${generatedFiles.length} exports');
+  }
+}
+
+Builder tsIndexBuilder(BuilderOptions options) => TsIndexBuilder(options.config);
+
+--- END FILE ---
+

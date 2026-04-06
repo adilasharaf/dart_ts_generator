@@ -53,7 +53,7 @@ class ClassInfo {
     this.superclassName,
     required this.fields,
     required this.isEnum,
-    this.enumValues = const [],
+    required this.enumValues,
     required this.isAbstract,
   });
 }
