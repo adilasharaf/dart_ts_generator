@@ -57,9 +57,11 @@ class _TsIndexBuilder implements Builder {
       return "export * from '$rel';";
     });
 
-    final outputPath =
-        _options.config['barrel_file'] as String? ?? 'lib/gen/eimodels.g.ts';
-    final outputId = AssetId(buildStep.inputId.package, outputPath);
+    // FIX: Use buildStep.allowedOutputs.single instead of constructing the
+    // AssetId manually. build_runner pre-computes the correct output AssetId
+    // from the buildExtensions map, so using it avoids any path mismatch and
+    // ensures the write is pre-approved (no UnexpectedOutputException).
+    final outputId = buildStep.allowedOutputs.single;
 
     final content = [
       '// AUTO-GENERATED — DO NOT EDIT.',

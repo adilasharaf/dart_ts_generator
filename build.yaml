@@ -1,54 +1,31 @@
-# build.yaml
-#
-# dart_ts_generator — builder declarations.
-#
-# Consumer projects do NOT need a build.yaml; builders apply automatically
-# via `auto_apply: dependents`.
-#
-# Consumers CAN add a build.yaml to tune options:
-#
-#   targets:
-#     $default:
-#       builders:
-#         dart_ts_generator|dart_ts_file_builder:
-#           options:
-#             date_time_as_string: false
-#         dart_ts_generator|dart_ts_index_builder:
-#           options:
-#             barrel_file: lib/gen/eimodels.g.ts   # default, change if needed
-
 builders:
-
-  # ── Primary builder ──────────────────────────────────────────────────────
-  # Per-file: lib/src/Foo.dart → lib/gen/src/Foo.g.ts
-  #
-  # Uses capture-group syntax so build_runner pre-approves each output path:
-  #   ^lib/{{}}.dart  matches lib/src/Vehicle.dart  (capture: src/Vehicle)
-  #   lib/gen/{{}}.g.ts resolves to lib/gen/src/Vehicle.g.ts
+  # ── Per-file builder ──────────────────────────────────────────────────────
+  # Converts each lib/**/*.dart → lib/gen/**/*.g.ts
+  # Uses a capture-group extension so build_runner pre-approves each output
+  # path before build() runs.
   dart_ts_file_builder:
     import: "package:dart_ts_generator/builder.dart"
     builder_factories: ["dartTsFileBuilder"]
-    build_extensions:
-      "^lib/{{}}.dart": ["lib/gen/{{}}.g.ts"]
-    auto_apply: dependents
+    build_extensions: { "^lib/{{}}.dart": ["lib/gen/{{}}.g.ts"] }
+    auto_apply: root_package
     build_to: source
-    defaults:
-      generate_for:
-        include:
-          - lib/**/*.dart
-        exclude:
-          - lib/**/*.g.dart
-          - lib/**/*.freezed.dart
-          - lib/gen/**
+    runs_before:
+      - "dart_ts_generator|ts_index_builder"
 
-  # ── Barrel builder ───────────────────────────────────────────────────────
-  # Runs once per package; writes lib/gen/eimodels.g.ts that re-exports all
-  # per-file .g.ts outputs as a single entry point for consumers.
-  dart_ts_index_builder:
+  # ── Barrel / index builder ────────────────────────────────────────────────
+  # Collects all lib/gen/**/*.g.ts produced above and emits a single
+  # lib/gen/eimodels.g.ts that re-exports every schema.
+  #
+  # FIX: `required_inputs` forces build_runner to place this builder in a
+  # later phase than dart_ts_file_builder.  Without it both builders land in
+  # the same phase, findAssets('lib/gen/**.g.ts') returns nothing because the
+  # individual .g.ts files haven't been written yet, and the barrel is never
+  # generated.
+  ts_index_builder:
     import: "package:dart_ts_generator/index_builder.dart"
     builder_factories: ["tsIndexBuilder"]
-    build_extensions:
-      "$lib$": ["gen/eimodels.g.ts"]
-    auto_apply: dependents
+    build_extensions: { "$lib$": ["gen/eimodels.g.ts"] }
+    auto_apply: root_package
     build_to: source
-    is_optional: true
+    required_inputs:
+      - "lib/gen/**.g.ts"
