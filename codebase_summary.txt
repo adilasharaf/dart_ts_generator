@@ -214,7 +214,7 @@ export 'generator.dart';
 
 --- END FILE ---
 
-FILE: ./gen/erator.dart
+FILE: ./lib/generator.dart
 // lib/src/generator.dart
 //
 // Core generation logic. Orchestrates ModelAnalyzer → ZodGenerator.
@@ -1644,6 +1644,11 @@ FILE: ./lib/index_builder.dart
 // TSC compiles gen/ → dist/, so the barrel becomes dist/eimodels.g.js
 // which package.json points at via "main" / "exports".
 //
+// ── Why $package$ and not $lib$ ──────────────────────────────────────────────
+// $lib$ is a synthetic anchor whose outputs must live inside lib/.
+// Since eimodels.g.ts now lives at the root gen/ folder (outside lib/),
+// we use $package$ instead — its outputs may be anywhere in the package.
+//
 // ── Potential name conflict ───────────────────────────────────────────────────
 // If two source files export a symbol with the same name, TypeScript raises:
 //   "Module X has already exported a member named Y."
@@ -1663,9 +1668,12 @@ class _TsIndexBuilder implements Builder {
   final BuilderOptions _options;
   _TsIndexBuilder(this._options);
 
+  // FIX 1: Use $package$ (not $lib$) so build_runner allows outputs
+  // outside lib/. The declared output gen/eimodels.g.ts sits at the
+  // package root, not inside lib/, so $lib$ would reject it.
   @override
   Map<String, List<String>> get buildExtensions => const {
-    r'$lib$': ['gen/eimodels.g.ts'],
+    r'$package$': ['gen/eimodels.g.ts'],
   };
 
   @override
@@ -1681,8 +1689,9 @@ class _TsIndexBuilder implements Builder {
 
     if (assets.isEmpty) return;
 
-    // Barrel lives at gen/eimodels.g.ts — all relative paths from there.
-    const barrelDir = 'gen/';
+    // FIX 2: barrelDir must match where eimodels.g.ts actually lives.
+    // All relative export paths are computed from this directory.
+    const barrelDir = 'gen';
 
     final exportLines = assets.map((asset) {
       var rel = p.posix.relative(asset.path, from: barrelDir);
@@ -1691,10 +1700,9 @@ class _TsIndexBuilder implements Builder {
       return "export * from '$rel';";
     });
 
-    // FIX: Use buildStep.allowedOutputs.single instead of constructing the
-    // AssetId manually. build_runner pre-computes the correct output AssetId
-    // from the buildExtensions map, so using it avoids any path mismatch and
-    // ensures the write is pre-approved (no UnexpectedOutputException).
+    // allowedOutputs.single is the AssetId build_runner pre-computed from
+    // the $package$ buildExtensions entry — always use this instead of
+    // constructing AssetId manually.
     final outputId = buildStep.allowedOutputs.single;
 
     final content = [
