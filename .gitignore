@@ -24,7 +24,8 @@ doc/api/
 *.js_
 *.js.deps
 *.js.map
-
+*.g.dart
+*.g.ts
 .flutter-plugins
 .flutter-plugins-dependencies
 example/dist/
