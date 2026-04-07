@@ -1,31 +1,26 @@
 builders:
   # ── Per-file builder ──────────────────────────────────────────────────────
-  # Converts each lib/**/*.dart → lib/gen/**/*.g.ts
-  # Uses a capture-group extension so build_runner pre-approves each output
-  # path before build() runs.
+  # Converts each lib/**/*.dart → gen/**/*.g.ts (root-level gen/, not lib/gen/)
   dart_ts_file_builder:
     import: "package:dart_ts_generator/builder.dart"
     builder_factories: ["dartTsFileBuilder"]
-    build_extensions: { "^lib/{{}}.dart": ["lib/gen/{{}}.g.ts"] }
+    build_extensions: { "^lib/{{}}.dart": ["gen/{{}}.g.ts"] }
     auto_apply: root_package
     build_to: source
     runs_before:
       - "dart_ts_generator|ts_index_builder"
 
   # ── Barrel / index builder ────────────────────────────────────────────────
-  # Collects all lib/gen/**/*.g.ts produced above and emits a single
-  # lib/gen/eimodels.g.ts that re-exports every schema.
+  # Collects all gen/**/*.g.ts and emits gen/eimodels.g.ts barrel.
   #
-  # FIX: `required_inputs` forces build_runner to place this builder in a
-  # later phase than dart_ts_file_builder.  Without it both builders land in
-  # the same phase, findAssets('lib/gen/**.g.ts') returns nothing because the
-  # individual .g.ts files haven't been written yet, and the barrel is never
-  # generated.
+  # Uses $package$ (not $lib$) because the output lives outside lib/.
+  # required_inputs ensures this runs in a later phase than dart_ts_file_builder
+  # so findAssets('gen/**.g.ts') actually finds the generated files.
   ts_index_builder:
     import: "package:dart_ts_generator/index_builder.dart"
     builder_factories: ["tsIndexBuilder"]
-    build_extensions: { "$lib$": ["gen/eimodels.g.ts"] }
+    build_extensions: { "$package$": ["gen/eimodels.g.ts"] }
     auto_apply: root_package
     build_to: source
     required_inputs:
-      - "lib/gen/**.g.ts"
+      - "gen/**.g.ts"

@@ -2,11 +2,11 @@
 //
 // ── Output layout ─────────────────────────────────────────────────────────────
 //
-//   lib/src/Vehicle.dart           →  lib/gen/src/Vehicle.g.ts
-//   lib/src/enums/DLStatus.dart    →  lib/gen/src/enums/DLStatus.g.ts
-//   lib/src/config/AppConfig.dart  →  lib/gen/src/config/AppConfig.g.ts
+//   lib/src/Vehicle.dart           →  gen/src/Vehicle.g.ts
+//   lib/src/enums/DLStatus.dart    →  gen/src/enums/DLStatus.g.ts
+//   lib/src/config/AppConfig.dart  →  gen/src/config/AppConfig.g.ts
 //
-// TSC then compiles lib/gen/**/*.g.ts  →  dist/
+// TSC then compiles gen/**/*.g.ts  →  dist/
 // package.json points at dist/ for npm / git-dependency consumers.
 //
 // ── Why the capture-group pattern ────────────────────────────────────────────
@@ -14,14 +14,14 @@
 // buildExtensions BEFORE build() runs.  A simple ".dart" → ".g.ts" map only
 // allows writing alongside the source file (lib/src/Foo.g.ts).
 //
-// The `^lib/{{}}.dart` → `lib/gen/{{}}.g.ts` pattern uses build_runner's
+// The `^lib/{{}}.dart` → `gen/{{}}.g.ts` pattern uses build_runner's
 // capture-group syntax:
 //   • `^`    – match the full asset path (not just a suffix).
 //   • `{{}}` – capture group that expands to everything between lib/ and .dart,
 //              e.g. "src/enums/DLStatus" for lib/src/enums/DLStatus.dart.
 //
 // This tells build_runner the exact output path for each input up-front, so
-// writing lib/gen/src/enums/DLStatus.g.ts is pre-approved — no
+// writing gen/src/enums/DLStatus.g.ts is pre-approved — no
 // UnexpectedOutputException.
 //
 // We use `buildStep.allowedOutputs.single` to retrieve the pre-computed output
@@ -57,11 +57,11 @@ class _TsFileBuilder implements Builder {
 
   /// Capture-group mapping (resolved by build_runner before build() is called):
   ///
-  ///   lib/src/Vehicle.dart           →  lib/gen/src/Vehicle.g.ts
-  ///   lib/src/enums/DLStatus.dart    →  lib/gen/src/enums/DLStatus.g.ts
+  ///   lib/src/Vehicle.dart           →  gen/src/Vehicle.g.ts
+  ///   lib/src/enums/DLStatus.dart    →  gen/src/enums/DLStatus.g.ts
   @override
   Map<String, List<String>> get buildExtensions => const {
-    r'^lib/{{}}.dart': ['lib/gen/{{}}.g.ts'],
+    r'^lib/{{}}.dart': ['gen/{{}}.g.ts'],
   };
 
   @override
