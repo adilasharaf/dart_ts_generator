@@ -1,0 +1,33 @@
+# ── TypeScript / Node artefacts ──────────────────────────────────────────────
+
+# These are only relevant for npm/git consumers of the generated TS output.
+
+# Dart / pub.dev consumers don't need any of this.
+
+# Generated TypeScript output
+
+gen/
+
+# Node & TypeScript project files
+
+node_modules/
+dist/
+package.json
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+tsconfig.json
+tsconfig.build.json
+.npmignore
+.npmrc
+
+# TypeScript source maps / declarations (if any)
+
+**/\*.js.map
+**/\*.d.ts
+
+# ── General noise ─────────────────────────────────────────────────────────────
+
+.DS_Store
+Thumbs.db
+\*.log

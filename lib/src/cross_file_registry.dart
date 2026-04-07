@@ -4,15 +4,15 @@
 // scanned source files to its metadata.
 //
 // ── Import path calculation ───────────────────────────────────────────────────
-// Generated files live at  lib/gen/**/*.g.ts  (not alongside the source).
+// Generated files live at  gen/**/*.g.ts  (not alongside the source).
 // Cross-file imports inside .g.ts files must therefore be relative to
-// lib/gen/, not lib/.
+// gen/, not lib/.
 //
-//   Source:  lib/src/Vehicle.dart        → output: lib/gen/src/Vehicle.g.ts
-//   Source:  lib/src/enums/DLStatus.dart → output: lib/gen/src/enums/DLStatus.g.ts
+//   Source:  lib/src/Vehicle.dart        → output: gen/src/Vehicle.g.ts
+//   Source:  lib/src/enums/DLStatus.dart → output: gen/src/enums/DLStatus.g.ts
 //
 //   Import from Vehicle.g.ts → DLStatus.g.ts:
-//     ../enums/DLStatus          (relative from lib/gen/src/ to lib/gen/src/enums/)
+//     ../enums/DLStatus          (relative from gen/src/ to gen/src/enums/)
 
 import 'package:path/path.dart' as p;
 
@@ -72,7 +72,7 @@ class CrossFileRegistry {
   /// that defines [typeName].
   ///
   /// Both arguments are **source** asset paths (e.g. "lib/src/Vehicle.dart").
-  /// We convert them to their output paths under lib/gen/ before computing
+  /// We convert them to their output paths under gen/ before computing
   /// the relative path.
   ///
   /// Returns null if [typeName] is unknown or defined in the same source file.
@@ -85,7 +85,7 @@ class CrossFileRegistry {
       return null;
     }
 
-    // Convert source paths → lib/gen/ output paths.
+    // Convert source paths → gen/ output paths.
     final fromGenTs = _sourceToGenTsPath(fromSourceAssetPath);
     final toGenTs = _sourceToGenTsPath(toSourcePath);
 
@@ -102,10 +102,10 @@ class CrossFileRegistry {
 
   // ── Helpers ───────────────────────────────────────────────────────────────
 
-  /// Maps a source asset path to its generated output path under lib/gen/.
+  /// Maps a source asset path to its generated output path under gen/.
   ///
-  ///   lib/src/Vehicle.dart        →  lib/gen/src/Vehicle.g.ts
-  ///   lib/src/enums/DLStatus.dart →  lib/gen/src/enums/DLStatus.g.ts
+  ///   lib/src/Vehicle.dart        →  gen/src/Vehicle.g.ts
+  ///   lib/src/enums/DLStatus.dart →  gen/src/enums/DLStatus.g.ts
   String _sourceToGenTsPath(String sourcePath) {
     // Strip leading lib/
     final withoutLib = sourcePath.startsWith('lib/')
@@ -117,6 +117,6 @@ class CrossFileRegistry {
         ? withoutLib.substring(0, withoutLib.length - '.dart'.length)
         : withoutLib;
 
-    return 'lib/gen/$withoutDart.g.ts';
+    return 'gen/$withoutDart.g.ts';
   }
 }

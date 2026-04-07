@@ -2,21 +2,21 @@
 
 A production-ready Dart `build_runner` package that generates **TypeScript types and Zod schemas** from Dart models annotated with `json_serializable`.
 
-| Feature | Status |
-|---|---|
-| Custom JsonConverter (DateTime, Timestamp, GeoPoint) | ✅ with `.transform()` |
-| `@JsonKey` defaults & field name overrides | ✅ |
-| Inheritance (`extends`) → Zod `.extend()` | ✅ topologically sorted |
-| Nullable fields | ✅ `.optional()` |
-| Enums → `z.enum()` | ✅ |
-| Nested model references | ✅ schema name refs |
-| Lists with converters | ✅ `z.array(z.any().transform(...))` |
-| `@TsIgnore` | ✅ field omitted |
-| Custom `fromJson`/`toJson` | ✅ → `z.any()` |
-| Cross-file imports (multi-file projects) | ✅ auto relative imports |
-| Index barrel (`index.ts`) | ✅ auto-generated |
-| Standalone CLI (no build_runner) | ✅ `dart_ts_gen` |
-| Constructor default extraction | ✅ via source text parsing |
+| Feature                                              | Status                               |
+| ---------------------------------------------------- | ------------------------------------ |
+| Custom JsonConverter (DateTime, Timestamp, GeoPoint) | ✅ with `.transform()`               |
+| `@JsonKey` defaults & field name overrides           | ✅                                   |
+| Inheritance (`extends`) → Zod `.extend()`            | ✅ topologically sorted              |
+| Nullable fields                                      | ✅ `.optional()`                     |
+| Enums → `z.enum()`                                   | ✅                                   |
+| Nested model references                              | ✅ schema name refs                  |
+| Lists with converters                                | ✅ `z.array(z.any().transform(...))` |
+| `@TsIgnore`                                          | ✅ field omitted                     |
+| Custom `fromJson`/`toJson`                           | ✅ → `z.any()`                       |
+| Cross-file imports (multi-file projects)             | ✅ auto relative imports             |
+| Index barrel (`index.ts`)                            | ✅ auto-generated                    |
+| Standalone CLI (no build_runner)                     | ✅ `dart_ts_gen`                     |
+| Constructor default extraction                       | ✅ via source text parsing           |
 
 ---
 
@@ -49,7 +49,7 @@ targets:
           include:
             - lib/models/**
         options:
-          output_dir: "lib/generated/ts"
+          output_dir: "gen/erated/ts"
           generate_index: true
           zod_import: "zod"
           firestore_transforms: true
@@ -88,6 +88,7 @@ The CLI runs a two-phase analysis pass, which means it correctly emits cross-fil
 ## Multi-file Output
 
 Given:
+
 ```
 lib/models/
   ei_base.dart       ← EiModel, EiAddress, EiAppSource, EiUserRole, EiRideStatus
@@ -96,8 +97,9 @@ lib/models/
 ```
 
 Generates:
+
 ```
-lib/generated/ts/
+gen/erated/ts/
   ei_base.g.ts
   ei_user.g.ts       ← imports EiModelSchema from './ei_base.g'
   ei_ride.g.ts       ← imports EiModelSchema from './ei_base.g'
@@ -109,19 +111,23 @@ lib/generated/ts/
 ## Feature Examples
 
 ### Enums
+
 ```dart
 enum EiAppSource { admin, user, other }
 ```
+
 ```ts
 export const EiAppSourceSchema = z.enum(["admin", "user", "other"]);
 export type EiAppSource = z.infer<typeof EiAppSourceSchema>;
 ```
 
 ### DateTimeNullableConverter
+
 ```dart
 @DateTimeNullableConverter()
 DateTime? addedOn;
 ```
+
 ```ts
 added_on:
   z.any().transform((val) =>
@@ -130,6 +136,7 @@ added_on:
 ```
 
 ### @JsonKey defaults
+
 ```dart
 @JsonKey(defaultValue: EiAppSource.other)
 EiAppSource lastModifiedAppSource;
@@ -140,6 +147,7 @@ double rating;
 @JsonKey(name: 'rider_categories', defaultValue: [])
 List<String> riderCategories;
 ```
+
 ```ts
 lastModifiedAppSource: EiAppSourceSchema.default("other"),
 rating: z.number().default(0),
@@ -147,9 +155,11 @@ rider_categories: z.array(z.string()).default([]),
 ```
 
 ### Inheritance (cross-file imports auto-generated)
+
 ```dart
 class EiUser extends EiModel { ... }
 ```
+
 ```ts
 import { EiModelSchema, EiAddressSchema, EiUserRoleSchema } from "./ei_base.g";
 
@@ -157,18 +167,20 @@ export const EiUserSchema = EiModelSchema.extend({
   user_id: z.string().optional(),
   role: EiUserRoleSchema.default("rider"),
   address: EiAddressSchema.optional(),
-  geoPoint: z.any().optional(),  // custom fromJson/toJson
+  geoPoint: z.any().optional(), // custom fromJson/toJson
   // internalCache → @TsIgnore, omitted
 });
 export type EiUser = z.infer<typeof EiUserSchema>;
 ```
 
 ### List with Converter
+
 ```dart
 @DateTimeListConverter()
 @JsonKey(name: 'checkpoint_times', defaultValue: [])
 List<DateTime> checkpointTimes;
 ```
+
 ```ts
 checkpoint_times:
   z.array(
@@ -179,10 +191,12 @@ checkpoint_times:
 ```
 
 ### @TsIgnore
+
 ```dart
 @TsIgnore()
 String? internalCache;
 ```
+
 → Completely absent from generated output.
 
 ---
@@ -191,24 +205,24 @@ String? internalCache;
 
 Matching is **substring, case-insensitive** on the converter class name:
 
-| Matches | Zod transform |
-|---|---|
-| `*DateTimeConverter*` | `val?.toDate ? val.toDate() : new Date(val)` |
-| `*DateTimeNullable*` | Same but returns `null` instead of Date on failure |
-| `*DateTimeList*` | Wraps in `z.array(z.any().transform(...))` |
-| `*Timestamp*` | Same as DateTimeConverter |
-| Anything else with `*Converter*` | `z.any()` opaque fallback |
+| Matches                          | Zod transform                                      |
+| -------------------------------- | -------------------------------------------------- |
+| `*DateTimeConverter*`            | `val?.toDate ? val.toDate() : new Date(val)`       |
+| `*DateTimeNullable*`             | Same but returns `null` instead of Date on failure |
+| `*DateTimeList*`                 | Wraps in `z.array(z.any().transform(...))`         |
+| `*Timestamp*`                    | Same as DateTimeConverter                          |
+| Anything else with `*Converter*` | `z.any()` opaque fallback                          |
 
 ---
 
 ## Firestore Type Handling
 
-| Dart type | Zod |
-|---|---|
-| `Timestamp` | `z.any().transform(val => val?.toDate ? ...)` |
-| `GeoPoint` | `z.any()` |
-| `DocumentReference` | `z.any()` |
-| `FieldValue` | `z.any()` |
+| Dart type           | Zod                                           |
+| ------------------- | --------------------------------------------- |
+| `Timestamp`         | `z.any().transform(val => val?.toDate ? ...)` |
+| `GeoPoint`          | `z.any()`                                     |
+| `DocumentReference` | `z.any()`                                     |
+| `FieldValue`        | `z.any()`                                     |
 
 ---
 
