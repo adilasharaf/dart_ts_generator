@@ -18,7 +18,29 @@ class TsType {
 }
 
 /// Marks a class for TypeScript generation.
-/// By default any class with @JsonSerializable is picked up automatically.
+///
+/// **Not required** when the class already has both:
+///   - a static `fromJson` or `fromMap` method (deserialization), AND
+///   - an instance `toMap` or `toJson` method (serialization).
+///
+/// Those two methods together are detected automatically, so plain
+/// hand-written model classes like:
+///
+/// ```dart
+/// class Signal {
+///   int? id;
+///   String? description;
+///
+///   static Signal fromJson(Map<String, dynamic> json) { ... }
+///   Map<String, dynamic> toMap() { ... }
+/// }
+/// ```
+///
+/// are picked up without any annotation.
+///
+/// Use `@TsGenerate` to **force** generation on classes that don't follow
+/// either the `@JsonSerializable` or the `fromJson`/`toMap` convention —
+/// for example, a class whose JSON parsing is done elsewhere.
 class TsGenerate {
   const TsGenerate();
 }
