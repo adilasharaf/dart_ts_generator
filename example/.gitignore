@@ -2,3 +2,5 @@ node_modules/
 .dart_tool/
 *.flutter
 dist/
+*.g.dart
+*.g.ts
