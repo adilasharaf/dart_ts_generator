@@ -469,6 +469,8 @@ class FieldInfo {
   final dynamic defaultValue;
 
   final bool hasDateTimeConverter;
+  final bool hasDateTimeListConverter;
+
   final bool hasDateTimeNullableConverter;
 
   /// From `@JsonKey(name: '...')`.
@@ -488,6 +490,7 @@ class FieldInfo {
     this.defaultValue,
     this.hasDateTimeConverter = false,
     this.hasDateTimeNullableConverter = false,
+    this.hasDateTimeListConverter = false,
     this.jsonKeyName,
     this.isIgnored = false,
   });
@@ -641,6 +644,10 @@ class ModelAnalyzer {
 
     // ── Converter annotations ─────────────────────────────────────────────
     final hasDateTimeConv = _hasAnnotationNamed(field, 'DateTimeConverter');
+    final hasDateTimeListConv = _hasAnnotationNamed(
+      field,
+      'DateTimeListConverter',
+    );
     final hasDateTimeNullableConv = _hasAnnotationNamed(
       field,
       'DateTimeNullableConverter',
@@ -684,6 +691,7 @@ class ModelAnalyzer {
       isEnum: isEnum,
       defaultValue: defaultValue,
       hasDateTimeConverter: hasDateTimeConv,
+      hasDateTimeListConverter: hasDateTimeListConv,
       hasDateTimeNullableConverter: hasDateTimeNullableConv,
       jsonKeyName: jsonKeyName,
     );
@@ -793,16 +801,6 @@ class ModelAnalyzer {
 
 FILE: ./lib/src/zod_generator.dart
 // lib/src/zod_generator.dart
-//
-// Converts [ClassInfo] / [FieldInfo] into TypeScript + Zod source text.
-//
-// ── Fix: circular-reference "implicitly has type 'any'" (TS7022) ────────────
-// TypeScript cannot infer the type of a `const` that references itself
-// (directly or indirectly through other schemas). Adding `: z.ZodTypeAny`
-// breaks the inference cycle.
-//
-//   Before:  export const FooSchema = z.object({ … });
-//   After:   export const FooSchema: z.ZodTypeAny = z.object({ … });
 
 import 'model_analyzer.dart';
 import 'cross_file_registry.dart';
@@ -816,194 +814,480 @@ class ZodGenerator {
   String generateFile(List<ClassInfo> classes, String assetPath) {
     if (classes.isEmpty) return '';
 
-    final importSet = <String>{};
+    final importMap = <String, Set<String>>{};
+    final externalImports = <String>{};
     final bodyBlocks = <String>[];
 
+    final graph = buildDependencyGraph(classes);
+    final topoOrder = topoSort(graph);
+    final cyclicTypes = findCyclicTypes(graph);
+
+    final classMap = {for (var c in classes) c.name: c};
+
+    // ───── ENUMS + INTERFACES ─────
     for (final cls in classes) {
       if (cls.isEnum) {
         bodyBlocks.add(_generateEnum(cls));
       } else {
-        final result = _generateClass(cls, assetPath);
-        importSet.addAll(result.imports);
-        bodyBlocks.add(result.code);
+        bodyBlocks.add(_generateInterface(cls));
       }
     }
 
-    final lines = <String>["import { z } from 'zod';"];
-    if (importSet.isNotEmpty) {
-      lines.add('');
-      lines.addAll(importSet.toList()..sort());
+    final generated = <String>{};
+
+    // ───── SCHEMAS (topo order) ─────
+    for (final name in topoOrder) {
+      final cls = classMap[name];
+      if (cls == null || cls.isEnum) continue;
+
+      final result = _generateSchema(cls, assetPath, cyclicTypes);
+      _mergeImports(importMap, externalImports, result.imports);
+      bodyBlocks.add(result.code);
+      generated.add(name);
     }
+
+    // fallback
+    for (final cls in classes) {
+      if (generated.contains(cls.name) || cls.isEnum) continue;
+
+      final result = _generateSchema(cls, assetPath, cyclicTypes);
+      _mergeImports(importMap, externalImports, result.imports);
+      bodyBlocks.add(result.code);
+    }
+
+    // ───── BUILD FILE ─────
+    final lines = <String>["import { z } from 'zod';"];
+
+    if (externalImports.isNotEmpty) {
+      lines.addAll(externalImports.toList()..sort());
+    }
+
+    if (importMap.isNotEmpty) {
+      for (final entry in importMap.entries) {
+        final imports = entry.value.toList()..sort();
+        lines.add("import { ${imports.join(', ')} } from '${entry.key}';");
+      }
+    }
+
     lines.add('');
-    lines.add(bodyBlocks.join('\n'));
+    lines.add(bodyBlocks.join('\n\n'));
+
     return lines.join('\n');
   }
 
+  // ───────── ENUM ─────────
+
   String _generateEnum(ClassInfo cls) {
-    final values = cls.enumValues.map((v) => '"$v"').join(', ');
+    final values = cls.enumValues.map((e) => "'$e'").join(', ');
+
     return [
-      '// ── ${cls.name} ──────────────────────────────────────────────────────',
-      'export const ${cls.name}Schema: z.ZodTypeAny = z.enum([$values]);',
+      '// ── ${cls.name} (Enum) ──',
+      'export const ${cls.name}Schema = z.enum([$values]);',
       'export type ${cls.name} = z.infer<typeof ${cls.name}Schema>;',
     ].join('\n');
   }
 
-  _GeneratorResult _generateClass(ClassInfo cls, String fromAssetPath) {
-    final imports = <String>{};
-    final fieldLines = <String>[];
+  // ───────── INTERFACE ─────────
 
-    if (cls.inheritedFields.isNotEmpty) {
-      final superName = cls.superclassName ?? 'base class';
-      fieldLines.add('  // ─ inherited from $superName ─');
-    }
+  String _generateInterface(ClassInfo cls) {
+    final lines = <String>[];
+
+    lines.add('// ── ${cls.name} (Type) ──');
+    lines.add('export interface ${cls.name} {');
 
     for (final field in cls.allFields) {
       if (field.isIgnored) continue;
+
+      final tsType = _tsTypeForField(field);
+      final optional = field.isNullable ? '?' : '';
+
+      lines.add('  ${field.effectiveJsonName}$optional: $tsType;');
+    }
+
+    lines.add('}');
+
+    return lines.join('\n');
+  }
+
+  String _tsTypeForField(FieldInfo field) {
+    String base;
+
+    if (field.isList) {
+      base = '${_tsType(field.listItemType ?? 'any')}[]';
+    } else if (field.isMap) {
+      base = 'Record<string, ${_tsType(field.mapValueType ?? 'any')}>';
+    } else {
+      base = _tsType(field.dartType);
+    }
+
+    if (field.isNullable) return '$base | null';
+    return base;
+  }
+
+  String _tsType(String dartType) {
+    if (_externalTypes.containsKey(dartType)) {
+      return _externalTypes[dartType]!.tsType;
+    }
+
+    const map = {
+      'String': 'string',
+      'int': 'number',
+      'double': 'number',
+      'num': 'number',
+      'bool': 'boolean',
+      'dynamic': 'any',
+      'Object': 'any',
+      'DateTime': 'Date',
+    };
+
+    return map[dartType] ?? dartType;
+  }
+
+  // ───────── SCHEMA ─────────
+
+  _GeneratorResult _generateSchema(
+    ClassInfo cls,
+    String fromAssetPath,
+    Set<String> cyclicTypes,
+  ) {
+    final imports = <_Import>{};
+    final fieldLines = <String>[];
+
+    for (final field in cls.allFields) {
+      if (field.isIgnored) continue;
+
       final result = _generateField(field, fromAssetPath);
       imports.addAll(result.imports);
+
       fieldLines.add('  ${field.effectiveJsonName}: ${result.zodExpr},');
     }
 
     final schemaName = '${cls.name}Schema';
-    // `: z.ZodTypeAny` annotation prevents TS7022 on circular schema references.
-    final code = [
-      '// ── ${cls.name} ──────────────────────────────────────────────────────',
-      'export const $schemaName: z.ZodTypeAny = z.object({',
-      ...fieldLines,
-      '});',
-      'export type ${cls.name} = z.infer<typeof $schemaName>;',
-    ].join('\n');
+    final isCyclic = cyclicTypes.contains(cls.name);
 
-    return _GeneratorResult(code: code, imports: imports);
+    final code = isCyclic
+        ? [
+            '// ── ${cls.name} (Schema) ──',
+            'export const $schemaName: z.ZodType<${cls.name}> = z.lazy(() =>',
+            '  z.object({',
+            ...fieldLines,
+            '  })',
+            ') as unknown as z.ZodType<${cls.name}>;',
+          ]
+        : [
+            '// ── ${cls.name} (Schema) ──',
+            'export const $schemaName: z.ZodType<${cls.name}> = z.object({',
+            ...fieldLines,
+            '});',
+          ];
+
+    return _GeneratorResult(code: code.join('\n'), imports: imports);
   }
 
+  // ───────── FIELD ─────────
+
   _FieldResult _generateField(FieldInfo field, String fromAssetPath) {
-    final imports = <String>{};
+    final imports = <_Import>{};
     String zodExpr;
 
+    // 🔥 DateTime converter
     if (field.hasDateTimeConverter || field.hasDateTimeNullableConverter) {
-      zodExpr = dateTimeAsString ? 'z.string()' : 'z.date()';
+      imports.add(
+        _Import.external(
+          "import { Timestamp } from 'firebase-admin/firestore';",
+        ),
+      );
+
+      zodExpr =
+          '''
+z.union([
+  z.date(),
+  z.number(),
+  z.instanceof(Timestamp)
+]).transform((val) => {
+  if (val instanceof Date) return val;
+  if (typeof val === 'number') return new Date(val);
+  return val.toDate();
+})
+'''
+              .trim();
+    }
+    // 🔥 DateTime list converter
+    else if (field.hasDateTimeListConverter) {
+      imports.add(
+        _Import.external(
+          "import { Timestamp } from 'firebase-admin/firestore';",
+        ),
+      );
+
+      zodExpr =
+          '''
+z.array(
+  z.union([
+    z.date(),
+    z.number(),
+    z.instanceof(Timestamp)
+  ]).transform((val) => {
+    if (val instanceof Date) return val;
+    if (typeof val === 'number') return new Date(val);
+    return val.toDate();
+  })
+)
+'''
+              .trim();
     } else if (field.isList) {
       final item = _zodForType(
         field.listItemType ?? 'dynamic',
         fromAssetPath,
-        imports: imports,
+        imports,
       );
       zodExpr = 'z.array($item)';
     } else if (field.isMap) {
       final value = _zodForType(
         field.mapValueType ?? 'dynamic',
         fromAssetPath,
-        imports: imports,
+        imports,
       );
       zodExpr = 'z.record(z.string(), $value)';
     } else {
-      zodExpr = _zodForType(field.dartType, fromAssetPath, imports: imports);
+      zodExpr = _zodForType(field.dartType, fromAssetPath, imports);
     }
 
     if (field.isNullable) zodExpr = '$zodExpr.nullish()';
 
-    final defaultVal = field.defaultValue;
-    if (defaultVal != null) {
-      final tsDefault = _dartDefaultToTs(defaultVal, field);
-      if (tsDefault != null) zodExpr = '$zodExpr.default($tsDefault)';
-    }
+    final def = _dartDefaultToTs(field.defaultValue);
+    if (def != null) zodExpr = '$zodExpr.default($def)';
 
-    return _FieldResult(zodExpr: zodExpr, imports: imports);
+    return _FieldResult(zodExpr, imports);
   }
+
+  // ───────── TYPE RESOLUTION ─────────
 
   String _zodForType(
     String dartType,
-    String fromAssetPath, {
-    required Set<String> imports,
-  }) {
-    if (dartType == 'DateTime') {
-      return dateTimeAsString ? 'z.string()' : 'z.date()';
+    String fromAssetPath,
+    Set<_Import> imports,
+  ) {
+    if (_externalTypes.containsKey(dartType)) {
+      final ext = _externalTypes[dartType]!;
+      imports.add(_Import.external(ext.import));
+      return ext.zodExpr;
     }
 
     final primitive = _primitives[dartType];
     if (primitive != null) return primitive;
 
-    if (_registry.isEnum(dartType)) {
-      final schemaRef = '${dartType}Schema';
-      _addImportIfNeeded(dartType, schemaRef, fromAssetPath, imports);
-      return schemaRef;
-    }
+    if (_registry.isEnum(dartType) || _registry.resolve(dartType) != null) {
+      final rel = _registry.relativeImportFor(
+        typeName: dartType,
+        fromSourceAssetPath: fromAssetPath,
+      );
 
-    if (_registry.resolve(dartType) != null) {
-      final schemaRef = '${dartType}Schema';
-      _addImportIfNeeded(dartType, schemaRef, fromAssetPath, imports);
-      return schemaRef;
+      if (rel != null) {
+        imports.add(_Import.normal(rel, dartType));
+      }
+
+      return '${dartType}Schema';
     }
 
     return 'z.unknown()';
   }
 
-  void _addImportIfNeeded(
-    String typeName,
-    String schemaRef,
-    String fromAssetPath,
-    Set<String> imports,
+  // ───────── IMPORT MERGE ─────────
+
+  void _mergeImports(
+    Map<String, Set<String>> map,
+    Set<String> external,
+    Set<_Import> imports,
   ) {
-    final rel = _registry.relativeImportFor(
-      typeName: typeName,
-      fromSourceAssetPath: fromAssetPath,
-    );
-    if (rel != null) {
-      imports.add("import { $schemaRef } from '$rel';");
+    for (final imp in imports) {
+      if (imp.isExternal) {
+        external.add(imp.raw!);
+        continue;
+      }
+
+      map.putIfAbsent(imp.path!, () => {});
+      map[imp.path!]!.add(imp.type!);
+      map[imp.path!]!.add('${imp.type!}Schema');
     }
   }
 
-  static const _primitives = <String, String>{
+  // ───────── GRAPH ─────────
+
+  Map<String, Set<String>> buildDependencyGraph(List<ClassInfo> classes) {
+    final graph = <String, Set<String>>{};
+
+    for (final cls in classes) {
+      final deps = <String>{};
+
+      for (final f in cls.allFields) {
+        if (_isValidType(f.dartType)) deps.add(f.dartType);
+        if (f.listItemType != null && _isValidType(f.listItemType!)) {
+          deps.add(f.listItemType!);
+        }
+      }
+
+      graph[cls.name] = deps;
+    }
+
+    return graph;
+  }
+
+  bool _isValidType(String type) {
+    return !_primitives.containsKey(type) &&
+        !_externalTypes.containsKey(type) &&
+        _registry.resolve(type) != null;
+  }
+
+  List<String> topoSort(Map<String, Set<String>> graph) {
+    final inDegree = <String, int>{};
+
+    for (final node in graph.keys) {
+      inDegree[node] = 0;
+    }
+
+    for (final deps in graph.values) {
+      for (final d in deps) {
+        if (inDegree.containsKey(d)) {
+          inDegree[d] = (inDegree[d] ?? 0) + 1;
+        }
+      }
+    }
+
+    final queue = <String>[];
+    for (final e in inDegree.entries) {
+      if (e.value == 0) queue.add(e.key);
+    }
+
+    final result = <String>[];
+
+    while (queue.isNotEmpty) {
+      final node = queue.removeLast();
+      result.add(node);
+
+      for (final dep in graph[node] ?? {}) {
+        if (!inDegree.containsKey(dep)) continue;
+
+        final newVal = (inDegree[dep] ?? 0) - 1;
+        inDegree[dep] = newVal;
+
+        if (newVal == 0) queue.add(dep);
+      }
+    }
+
+    return result;
+  }
+
+  Set<String> findCyclicTypes(Map<String, Set<String>> graph) {
+    final visited = <String>{};
+    final stack = <String>{};
+    final cyclic = <String>{};
+
+    void dfs(String node) {
+      if (stack.contains(node)) {
+        cyclic.add(node);
+        return;
+      }
+      if (visited.contains(node)) return;
+
+      visited.add(node);
+      stack.add(node);
+
+      for (final n in graph[node] ?? {}) {
+        dfs(n);
+        if (cyclic.contains(n)) cyclic.add(node);
+      }
+
+      stack.remove(node);
+    }
+
+    for (final node in graph.keys) {
+      dfs(node);
+    }
+
+    return cyclic;
+  }
+
+  static const _primitives = {
     'String': 'z.string()',
     'int': 'z.number().int()',
     'double': 'z.number()',
     'num': 'z.number()',
     'bool': 'z.boolean()',
-    'DateTime': 'z.date()',
     'dynamic': 'z.unknown()',
     'Object': 'z.unknown()',
-    'List': 'z.array(z.unknown())',
-    'Map': 'z.record(z.unknown())',
-    'Set': 'z.array(z.unknown())',
-    'Uint8List': 'z.instanceof(Uint8Array)',
-    'Int8List': 'z.instanceof(Int8Array)',
-    'Uint16List': 'z.instanceof(Uint16Array)',
-    'Int16List': 'z.instanceof(Int16Array)',
-    'Uint32List': 'z.instanceof(Uint32Array)',
-    'Int32List': 'z.instanceof(Int32Array)',
-    'Float32List': 'z.instanceof(Float32Array)',
-    'Float64List': 'z.instanceof(Float64Array)',
-    'ByteData': 'z.instanceof(ArrayBuffer)',
-    'BigInt': 'z.bigint()',
-    'Uri': 'z.string().url()',
-    'Duration': 'z.number()',
-    'RegExp': 'z.instanceof(RegExp)',
-    'Map<String, dynamic>': 'z.record(z.unknown())',
-    'Map<String, Object?>': 'z.record(z.unknown())',
+    'DateTime': 'z.date()',
   };
 
-  String? _dartDefaultToTs(dynamic value, FieldInfo field) {
-    if (value == null) return null;
+  static const _externalTypes = {
+    'GeoPoint': _ExternalType(
+      tsType: 'GeoPoint',
+      zodExpr: 'z.instanceof(GeoPoint)',
+      import: "import { GeoPoint } from 'firebase-admin/firestore';",
+    ),
+    'Timestamp': _ExternalType(
+      tsType: 'Timestamp',
+      zodExpr: 'z.instanceof(Timestamp)',
+      import: "import { Timestamp } from 'firebase-admin/firestore';",
+    ),
+  };
+
+  String? _dartDefaultToTs(dynamic value) {
     if (value is bool) return value ? 'true' : 'false';
-    if (value is int) return '$value';
-    if (value is double) return '$value';
+    if (value is num) return '$value';
     if (value is String) return '"$value"';
     if (value is List) return '[]';
     return null;
   }
 }
 
+// ───────── HELPERS ─────────
+
+class _Import {
+  final String? path;
+  final String? type;
+  final String? raw;
+  final bool isExternal;
+
+  _Import.normal(this.path, this.type) : raw = null, isExternal = false;
+
+  _Import.external(this.raw) : path = null, type = null, isExternal = true;
+
+  @override
+  bool operator ==(Object other) =>
+      other is _Import &&
+      other.path == path &&
+      other.type == type &&
+      other.raw == raw;
+
+  @override
+  int get hashCode => Object.hash(path, type, raw);
+}
+
 class _FieldResult {
   final String zodExpr;
-  final Set<String> imports;
-  const _FieldResult({required this.zodExpr, required this.imports});
+  final Set<_Import> imports;
+
+  _FieldResult(this.zodExpr, this.imports);
 }
 
 class _GeneratorResult {
   final String code;
-  final Set<String> imports;
-  const _GeneratorResult({required this.code, required this.imports});
+  final Set<_Import> imports;
+
+  _GeneratorResult({required this.code, required this.imports});
+}
+
+class _ExternalType {
+  final String tsType;
+  final String zodExpr;
+  final String import;
+
+  const _ExternalType({
+    required this.tsType,
+    required this.zodExpr,
+    required this.import,
+  });
 }
 
 --- END FILE ---

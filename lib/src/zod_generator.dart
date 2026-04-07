@@ -99,7 +99,7 @@ class ZodGenerator {
       final tsType = _tsTypeForField(field);
       final optional = field.isNullable ? '?' : '';
 
-      lines.add('  ${field.effectiveJsonName}$optional: $tsType;');
+      lines.add('  ${_tsKey(field.effectiveJsonName)}$optional: $tsType;');
     }
 
     lines.add('}');
@@ -157,7 +157,9 @@ class ZodGenerator {
       final result = _generateField(field, fromAssetPath);
       imports.addAll(result.imports);
 
-      fieldLines.add('  ${field.effectiveJsonName}: ${result.zodExpr},');
+      fieldLines.add(
+        '  ${_tsKey(field.effectiveJsonName)}: ${result.zodExpr},',
+      );
     }
 
     final schemaName = '${cls.name}Schema';
@@ -335,6 +337,13 @@ z.array(
     return !_primitives.containsKey(type) &&
         !_externalTypes.containsKey(type) &&
         _registry.resolve(type) != null;
+  }
+
+  /// Wraps [name] in single quotes if it is not a valid bare JS identifier
+  /// (e.g. dotted names like 'driversLicense.licenceVerificationStatus').
+  String _tsKey(String name) {
+    const _identPattern = r'^[a-zA-Z_$][a-zA-Z0-9_$]*$';
+    return RegExp(_identPattern).hasMatch(name) ? name : "'$name'";
   }
 
   List<String> topoSort(Map<String, Set<String>> graph) {
