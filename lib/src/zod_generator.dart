@@ -382,7 +382,7 @@ z.array(
       }
     }
 
-    return result;
+    return result.reversed.toList();
   }
 
   Set<String> findCyclicTypes(Map<String, Set<String>> graph) {
