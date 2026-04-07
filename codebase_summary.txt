@@ -285,7 +285,29 @@ class TsType {
 }
 
 /// Marks a class for TypeScript generation.
-/// By default any class with @JsonSerializable is picked up automatically.
+///
+/// **Not required** when the class already has both:
+///   - a static `fromJson` or `fromMap` method (deserialization), AND
+///   - an instance `toMap` or `toJson` method (serialization).
+///
+/// Those two methods together are detected automatically, so plain
+/// hand-written model classes like:
+///
+/// ```dart
+/// class Signal {
+///   int? id;
+///   String? description;
+///
+///   static Signal fromJson(Map<String, dynamic> json) { ... }
+///   Map<String, dynamic> toMap() { ... }
+/// }
+/// ```
+///
+/// are picked up without any annotation.
+///
+/// Use `@TsGenerate` to **force** generation on classes that don't follow
+/// either the `@JsonSerializable` or the `fromJson`/`toMap` convention —
+/// for example, a class whose JSON parsing is done elsewhere.
 class TsGenerate {
   const TsGenerate();
 }
@@ -509,6 +531,11 @@ class ClassInfo {
   final String? superclassName;
   final bool hasJsonSerializable;
 
+  /// True when the class was detected via the manual fromJson/toMap pattern
+  /// rather than @JsonSerializable. Informational only — does not affect
+  /// code generation.
+  final bool hasManualSerialization;
+
   const ClassInfo({
     required this.name,
     required this.assetPath,
@@ -518,6 +545,7 @@ class ClassInfo {
     this.inheritedFields = const [],
     this.superclassName,
     this.hasJsonSerializable = false,
+    this.hasManualSerialization = false,
   });
 
   List<FieldInfo> get allFields => [...inheritedFields, ...ownFields];
@@ -578,6 +606,29 @@ class ModelAnalyzer {
       'JsonSerializable',
     );
 
+    // ── Explicit opt-in annotation ────────────────────────────────────────
+    // @TsGenerate forces generation even if the class has neither
+    // @JsonSerializable nor a fromJson/toMap pair.
+    final hasTsGenerate = _hasAnnotationNamed(element, 'TsGenerate');
+
+    // ── Manual serialization pattern detection ────────────────────────────
+    // A class qualifies when it has:
+    //   • a static `fromJson` or `fromMap` method  (deserialization), AND
+    //   • an instance `toMap` or `toJson` method   (serialization).
+    //
+    // This matches the common hand-written pattern:
+    //
+    //   static Signal fromJson(Map<String, dynamic> json) { ... }
+    //   Map<String, dynamic> toMap() { ... }
+    //
+    final hasFromJson = element.methods.any(
+      (m) => m.isStatic && (m.name == 'fromJson' || m.name == 'fromMap'),
+    );
+    final hasToMap = element.methods.any(
+      (m) => !m.isStatic && (m.name == 'toMap' || m.name == 'toJson'),
+    );
+    final hasManualSerialization = hasFromJson && hasToMap;
+
     // Own fields: declared directly on this class.
     // isOriginDeclaration == true  →  real declared field (not a synthetic
     // getter/setter created by the compiler).
@@ -596,7 +647,12 @@ class ModelAnalyzer {
       ownFields: ownFields,
       inheritedFields: inheritedFields,
       superclassName: _superclassName(element),
-      hasJsonSerializable: hasJsonSerializable,
+      // hasJsonSerializable drives the "should we emit this class" filter in
+      // builder.dart / generator.dart.  We fold all three detection paths
+      // into this single flag so no downstream changes are required.
+      hasJsonSerializable:
+          hasJsonSerializable || hasManualSerialization || hasTsGenerate,
+      hasManualSerialization: hasManualSerialization,
     );
   }
 

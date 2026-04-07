@@ -23,7 +23,7 @@ class LicenseApplication extends EiModel {
   @JsonKey(defaultValue: DLStatus.none)
   DLStatus dlStatus = DLStatus.none;
 
-  @JsonKey(defaultValue: false)
+  @JsonKey(defaultValue: false ,name: 'haveLicence')
   bool isAlreadyHaveLicence = false;
 
   @DateTimeConverter()

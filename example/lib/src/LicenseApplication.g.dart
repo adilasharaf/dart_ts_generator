@@ -31,7 +31,7 @@ LicenseApplication _$LicenseApplicationFromJson(
       : Rider.fromJson(json['rider'] as Map<String, dynamic>)
   ..dlStatus =
       $enumDecodeNullable(_$DLStatusEnumMap, json['dlStatus']) ?? DLStatus.none
-  ..isAlreadyHaveLicence = json['isAlreadyHaveLicence'] as bool? ?? false
+  ..isAlreadyHaveLicence = json['haveLicence'] as bool? ?? false
   ..llExpiry = _$JsonConverterFromJson<Object, DateTime>(
     json['llExpiry'],
     const DateTimeConverter().fromJson,
@@ -103,7 +103,7 @@ Map<String, dynamic> _$LicenseApplicationToJson(
   'selectedRto': instance.selectedRto?.toJson(),
   'rider': instance.rider?.toJson(),
   'dlStatus': _$DLStatusEnumMap[instance.dlStatus]!,
-  'isAlreadyHaveLicence': instance.isAlreadyHaveLicence,
+  'haveLicence': instance.isAlreadyHaveLicence,
   'llExpiry': _$JsonConverterToJson<Object, DateTime>(
     instance.llExpiry,
     const DateTimeConverter().toJson,

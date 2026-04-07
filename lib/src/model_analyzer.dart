@@ -22,6 +22,21 @@ import 'package:analyzer/dart/element/type.dart';
 
 import 'cross_file_registry.dart';
 
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+/// Converts a camelCase identifier to snake_case.
+///
+/// Examples:
+///   correctOption   → correct_option
+///   questionNumber  → question_number
+///   isAnswered      → is_answered
+///   answeredOption  → answered_option
+///   myURLParser     → my_url_parser
+String _camelToSnake(String s) => s.replaceAllMapped(
+  RegExp(r'(?<=[a-z])[A-Z]'),
+  (m) => '_${m.group(0)!.toLowerCase()}',
+);
+
 // ── Data models ──────────────────────────────────────────────────────────────
 
 /// Metadata for a single Dart field.
@@ -51,6 +66,16 @@ class FieldInfo {
 
   final bool isIgnored;
 
+  /// When true and [jsonKeyName] is null, [effectiveJsonName] will convert
+  /// the Dart camelCase field name to snake_case.
+  ///
+  /// Set for classes detected via the manual fromJson/toMap pattern, where
+  /// the JSON keys in the hand-written serialization are conventionally
+  /// snake_case (e.g. `correct_answer` for Dart field `correctOption`).
+  ///
+  /// An explicit `@JsonKey(name: '...')` always takes precedence over this.
+  final bool useSnakeCaseFallback;
+
   const FieldInfo({
     required this.name,
     required this.dartType,
@@ -66,9 +91,20 @@ class FieldInfo {
     this.hasDateTimeListConverter = false,
     this.jsonKeyName,
     this.isIgnored = false,
+    this.useSnakeCaseFallback = false,
   });
 
-  String get effectiveJsonName => jsonKeyName ?? name;
+  /// The JSON key to use in the generated TypeScript / Zod schema.
+  ///
+  /// Priority:
+  ///   1. Explicit `@JsonKey(name: '...')` → use as-is.
+  ///   2. [useSnakeCaseFallback] == true   → convert camelCase to snake_case.
+  ///   3. Fallback                         → raw Dart field name.
+  String get effectiveJsonName {
+    if (jsonKeyName != null) return jsonKeyName!;
+    if (useSnakeCaseFallback) return _camelToSnake(name);
+    return name;
+  }
 }
 
 /// Metadata for a Dart class or enum.
@@ -84,7 +120,7 @@ class ClassInfo {
 
   /// True when the class was detected via the manual fromJson/toMap pattern
   /// rather than @JsonSerializable. Informational only — does not affect
-  /// code generation.
+  /// code generation directly, but drives [useSnakeCaseFallback] on fields.
   final bool hasManualSerialization;
 
   const ClassInfo({
@@ -180,17 +216,27 @@ class ModelAnalyzer {
     );
     final hasManualSerialization = hasFromJson && hasToMap;
 
+    // For manually-serialized classes the hand-written fromJson/toMap
+    // conventionally uses snake_case JSON keys (e.g. `correct_answer`)
+    // while the Dart fields are camelCase (e.g. `correctOption`).
+    // We propagate this flag into _analyzeField so effectiveJsonName
+    // converts automatically — unless a field has an explicit @JsonKey(name:).
+    final useSnakeCase = hasManualSerialization && !hasJsonSerializable;
+
     // Own fields: declared directly on this class.
     // isOriginDeclaration == true  →  real declared field (not a synthetic
     // getter/setter created by the compiler).
     final ownFields = element.fields
         .where((f) => !f.isStatic && f.isOriginDeclaration)
-        .map(_analyzeField)
+        .map((f) => _analyzeField(f, useSnakeCase: useSnakeCase))
         .whereType<FieldInfo>()
         .toList();
 
     // Inherited fields from the full superclass chain.
-    final inheritedFields = _collectInheritedFields(element);
+    final inheritedFields = _collectInheritedFields(
+      element,
+      useSnakeCase: useSnakeCase,
+    );
 
     return ClassInfo(
       name: element.name!,
@@ -210,9 +256,10 @@ class ModelAnalyzer {
   // ── Inherited fields ──────────────────────────────────────────────────────
 
   List<FieldInfo> _collectInheritedFields(
-    ClassElement element, [
+    ClassElement element, {
+    bool useSnakeCase = false,
     int depth = 0,
-  ]) {
+  }) {
     if (depth > 8) return const [];
 
     // ClassElement.supertype returns InterfaceType? in analyzer >=7.
@@ -223,11 +270,15 @@ class ModelAnalyzer {
     if (superEl is! ClassElement || superEl.name == 'Object') return const [];
 
     // Recurse so deepest ancestor fields appear first.
-    final ancestorFields = _collectInheritedFields(superEl, depth + 1);
+    final ancestorFields = _collectInheritedFields(
+      superEl,
+      useSnakeCase: useSnakeCase,
+      depth: depth + 1,
+    );
 
     final parentFields = superEl.fields
         .where((f) => !f.isStatic && f.isOriginDeclaration)
-        .map(_analyzeField)
+        .map((f) => _analyzeField(f, useSnakeCase: useSnakeCase))
         .whereType<FieldInfo>()
         .toList();
 
@@ -236,7 +287,7 @@ class ModelAnalyzer {
 
   // ── Single field ──────────────────────────────────────────────────────────
 
-  FieldInfo? _analyzeField(FieldElement field) {
+  FieldInfo? _analyzeField(FieldElement field, {bool useSnakeCase = false}) {
     // ── @JsonKey ──────────────────────────────────────────────────────────
     final jsonKey = _getAnnotationNamed(field, 'JsonKey');
 
@@ -301,6 +352,10 @@ class ModelAnalyzer {
       hasDateTimeListConverter: hasDateTimeListConv,
       hasDateTimeNullableConverter: hasDateTimeNullableConv,
       jsonKeyName: jsonKeyName,
+      // Only apply snake_case fallback when there is no explicit @JsonKey(name:).
+      // This ensures @JsonKey always wins, and snake_case only kicks in for
+      // manual-serialization classes that have no per-field override.
+      useSnakeCaseFallback: jsonKeyName == null && useSnakeCase,
     );
   }
 
