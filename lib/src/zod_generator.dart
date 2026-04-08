@@ -154,7 +154,7 @@ class ZodGenerator {
     for (final field in cls.allFields) {
       if (field.isIgnored) continue;
 
-      final result = _generateField(field, fromAssetPath);
+      final result = _generateField(field, fromAssetPath, cyclicTypes);
       imports.addAll(result.imports);
 
       fieldLines.add(
@@ -186,7 +186,11 @@ class ZodGenerator {
 
   // ───────── FIELD ─────────
 
-  _FieldResult _generateField(FieldInfo field, String fromAssetPath) {
+  _FieldResult _generateField(
+    FieldInfo field,
+    String fromAssetPath,
+    Set<String> cyclicTypes,
+  ) {
     final imports = <_Import>{};
     String zodExpr;
 
@@ -240,6 +244,7 @@ z.array(
         field.listItemType ?? 'dynamic',
         fromAssetPath,
         imports,
+        cyclicTypes,
       );
       zodExpr = 'z.array($item)';
     } else if (field.isMap) {
@@ -247,10 +252,16 @@ z.array(
         field.mapValueType ?? 'dynamic',
         fromAssetPath,
         imports,
+        cyclicTypes,
       );
       zodExpr = 'z.record(z.string(), $value)';
     } else {
-      zodExpr = _zodForType(field.dartType, fromAssetPath, imports);
+      zodExpr = _zodForType(
+        field.dartType,
+        fromAssetPath,
+        imports,
+        cyclicTypes,
+      );
     }
 
     if (field.isNullable) zodExpr = '$zodExpr.nullish()';
@@ -267,6 +278,7 @@ z.array(
     String dartType,
     String fromAssetPath,
     Set<_Import> imports,
+    Set<String> cyclicTypes,
   ) {
     if (_externalTypes.containsKey(dartType)) {
       final ext = _externalTypes[dartType]!;
@@ -285,6 +297,12 @@ z.array(
 
       if (rel != null) {
         imports.add(_Import.normal(rel, dartType));
+      }
+
+      final isCyclic = cyclicTypes.contains(dartType);
+
+      if (isCyclic) {
+        return 'z.lazy(() => ${dartType}Schema)';
       }
 
       return '${dartType}Schema';
