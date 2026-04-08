@@ -2,10 +2,10 @@
 find . -maxdepth 4 -not -path '*/.*' \
   -not -path '*/test/*' -not -path '*/example/*' \
   -not -path '*/bin/*' -not -path '*/node_modules/*' \
-  | sed 's/[^/]*\//  /g' > codebase_summary.txt
+  | sed 's/[^/]*\//  /g' > code_summary.txt
 
 # 2. Append the header
-echo -e "\n--- FILE CONTENTS ---\n" >> codebase_summary.txt
+echo -e "\n--- FILE CONTENTS ---\n" >> code_summary.txt
 
 # 3. Find and cat the code files, ignoring the requested paths and locks/readmes
 find . -type f \( -name "*.dart" -o -name "*.go" -o -name "*.ts" \) \
@@ -17,4 +17,6 @@ find . -type f \( -name "*.dart" -o -name "*.go" -o -name "*.ts" \) \
   -not -name "README.md" \
   -exec echo "FILE: {}" \; \
   -exec cat {} \; \
-  -exec echo -e "\n--- END FILE ---\n" \; >> codebase_summary.txt
+  -exec echo -e "\n--- END FILE ---\n" \; >> code_summary.txt
+
+  mkdir -p docs && mv code_summary.txt docs/code_summary.txt
