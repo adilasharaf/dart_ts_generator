@@ -35,6 +35,7 @@
 import 'dart:async';
 
 import 'package:analyzer/dart/element/element.dart';
+import 'package:analyzer/dart/element/type.dart';
 import 'package:build/build.dart';
 import 'package:glob/glob.dart';
 
@@ -120,6 +121,21 @@ class _TsFileBuilder implements Builder {
   }
 
   // ── Pre-scan ──────────────────────────────────────────────────────────────
+  //
+  // Walks every Dart source file and registers:
+  //   • Every enum   → name, values, source path
+  //   • Every class  → name, superclass, source path, AND fieldDeps
+  //
+  // fieldDeps is the set of non-primitive, non-enum model type names that the
+  // class directly references in its fields.  This is the data that makes
+  // cross-file cycle detection possible in CrossFileRegistry.globalCyclicTypes().
+  //
+  // We extract fieldDeps here (in the builder pre-scan) rather than in the
+  // ZodGenerator because:
+  //   1. The pre-scan already has fully-resolved LibraryElements for every
+  //      file — we just need to walk fields once more.
+  //   2. The registry is the only structure shared across all per-file
+  //      generateFile() calls, so it is the correct place to store global data.
 
   Future<void> _preScan(BuildStep buildStep, CrossFileRegistry registry) async {
     final assets = await buildStep.findAssets(Glob('lib/**.dart')).toList();
@@ -136,6 +152,7 @@ class _TsFileBuilder implements Builder {
           return;
         }
 
+        // ── Enums ───────────────────────────────────────────────────────────
         for (final e in lib.enums) {
           final values = e.fields
               .where((f) => f.isEnumConstant)
@@ -151,22 +168,76 @@ class _TsFileBuilder implements Builder {
           );
         }
 
+        // ── Classes ─────────────────────────────────────────────────────────
         for (final c in lib.classes) {
           final superType = c.supertype;
           final superName =
               (superType != null && superType.element.name != 'Object')
               ? superType.element.name
               : null;
+
+          // ── Extract field-level type dependencies ──────────────────────────
+          // We collect the bare (non-generic) type name of every field that is
+          // NOT a primitive and NOT a Dart SDK type.  These become directed
+          // edges in the global dependency graph inside CrossFileRegistry.
+          //
+          // We intentionally do NOT filter by "is it a known model?" here —
+          // the registry isn't fully populated yet while pre-scan is running
+          // in parallel.  The registry's globalCyclicTypes() filters out
+          // non-model types when it builds the graph later.
+          final fieldDeps = <String>{};
+          for (final field in c.fields) {
+            if (field.isStatic) continue;
+            if (!field.isOriginDeclaration) continue;
+
+            final type = field.type;
+            _collectTypeDeps(type, fieldDeps);
+          }
+
           registry.register(
             TypeInfo(
               name: c.name!,
               isEnum: false,
               sourceAssetPath: asset.path,
               superclassName: superName,
+              fieldDeps: fieldDeps,
             ),
           );
         }
       }),
     );
+  }
+
+  // ── Type dep extraction ───────────────────────────────────────────────────
+
+  static const _dartPrimitives = {
+    'String', 'int', 'double', 'num', 'bool', 'dynamic', 'Object',
+    'DateTime', 'Duration', 'void', 'Null', 'Never',
+    // Dart SDK collections — the type args are what matter, not these names
+    'List', 'Map', 'Set', 'Iterable',
+    // Firestore types handled separately by ZodGenerator
+    'Timestamp', 'GeoPoint', 'DocumentReference', 'FieldValue', 'Blob',
+  };
+
+  /// Recursively extracts model type names from [type] into [deps].
+  ///
+  /// Handles:
+  ///   • Direct types:          EiUser?           → 'EiUser'
+  ///   • List item types:       List<EiUser>       → 'EiUser'
+  ///   • Map value types:       Map<String, Rider> → 'Rider'
+  ///   • Nested generics:       List<List<EiUser>> → 'EiUser'
+  void _collectTypeDeps(DartType type, Set<String> deps) {
+    if (type is! InterfaceType) return;
+
+    final name = type.element.name;
+
+    if (!_dartPrimitives.contains(name)) {
+      deps.add(name!);
+    }
+
+    // Recurse into type arguments (List<T>, Map<K,V>, etc.)
+    for (final arg in type.typeArguments) {
+      _collectTypeDeps(arg, deps);
+    }
   }
 }

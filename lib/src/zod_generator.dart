@@ -9,6 +9,10 @@ class ZodGenerator {
 
   ZodGenerator(this._registry, {this.dateTimeAsString = false});
 
+  // ─────────────────────────────────────────────────────────────────────────────
+  // PUBLIC ENTRY POINT
+  // ─────────────────────────────────────────────────────────────────────────────
+
   String generateFile(List<ClassInfo> classes, String assetPath) {
     if (classes.isEmpty) return '';
 
@@ -16,11 +20,30 @@ class ZodGenerator {
     final externalImports = <String>{};
     final bodyBlocks = <String>[];
 
+    // ── Cyclic type resolution ────────────────────────────────────────────────
+    //
+    // We merge two independent cycle sets:
+    //
+    //   intraFileCyclicTypes  — types that form a cycle purely within this
+    //                           file's class list (e.g. a self-referential
+    //                           tree node).  Detected from the local field graph.
+    //
+    //   globalCyclicTypes     — types that participate in ANY cycle across ALL
+    //                           source files, detected by CrossFileRegistry using
+    //                           the fieldDeps collected during the pre-scan.
+    //                           This is the set that catches EiUser ↔ PendingPayment
+    //                           and every similar cross-file cycle.
+    //
+    // Any type in the union must have its schema wrapped in z.lazy() wherever
+    // it is referenced, to avoid the Node.js circular-import
+    // "cannot read properties of undefined" crash at module load time.
     final graph = buildDependencyGraph(classes);
-    final topoOrder = topoSort(graph);
-    final cyclicTypes = findCyclicTypes(graph);
+    final intraFileCyclicTypes = findCyclicTypes(graph);
+    final globalCyclicTypes = _registry.globalCyclicTypes();
+    final cyclicTypes = {...intraFileCyclicTypes, ...globalCyclicTypes};
 
     final classMap = {for (var c in classes) c.name: c};
+    final topoOrder = topoSort(graph);
 
     // ───── ENUMS + INTERFACES ─────
     for (final cls in classes) {
@@ -44,7 +67,7 @@ class ZodGenerator {
       generated.add(name);
     }
 
-    // fallback
+    // fallback for anything not reached by topo sort (e.g. isolated nodes)
     for (final cls in classes) {
       if (generated.contains(cls.name) || cls.isEnum) continue;
 
@@ -73,7 +96,9 @@ class ZodGenerator {
     return lines.join('\n');
   }
 
-  // ───────── ENUM ─────────
+  // ─────────────────────────────────────────────────────────────────────────────
+  // ENUM
+  // ─────────────────────────────────────────────────────────────────────────────
 
   String _generateEnum(ClassInfo cls) {
     final values = cls.enumValues.map((e) => "'$e'").join(', ');
@@ -85,7 +110,9 @@ class ZodGenerator {
     ].join('\n');
   }
 
-  // ───────── INTERFACE ─────────
+  // ─────────────────────────────────────────────────────────────────────────────
+  // INTERFACE
+  // ─────────────────────────────────────────────────────────────────────────────
 
   String _generateInterface(ClassInfo cls) {
     final lines = <String>[];
@@ -141,7 +168,9 @@ class ZodGenerator {
     return map[dartType] ?? dartType;
   }
 
-  // ───────── SCHEMA ─────────
+  // ─────────────────────────────────────────────────────────────────────────────
+  // SCHEMA
+  // ─────────────────────────────────────────────────────────────────────────────
 
   _GeneratorResult _generateSchema(
     ClassInfo cls,
@@ -163,6 +192,9 @@ class ZodGenerator {
     }
 
     final schemaName = '${cls.name}Schema';
+
+    // A schema must be wrapped in z.lazy() when the type itself is cyclic
+    // (self-referential or part of any intra- or cross-file cycle).
     final isCyclic = cyclicTypes.contains(cls.name);
 
     final code = isCyclic
@@ -184,7 +216,9 @@ class ZodGenerator {
     return _GeneratorResult(code: code.join('\n'), imports: imports);
   }
 
-  // ───────── FIELD ─────────
+  // ─────────────────────────────────────────────────────────────────────────────
+  // FIELD
+  // ─────────────────────────────────────────────────────────────────────────────
 
   _FieldResult _generateField(
     FieldInfo field,
@@ -203,8 +237,7 @@ class ZodGenerator {
       );
 
       zodExpr =
-          '''
-z.union([
+          '''z.union([
   z.date(),
   z.number(),
   z.instanceof(Timestamp)
@@ -212,8 +245,7 @@ z.union([
   if (val instanceof Date) return val;
   if (typeof val === 'number') return new Date(val);
   return val.toDate();
-})
-'''
+})'''
               .trim();
     }
     // 🔥 DateTime list converter
@@ -225,8 +257,7 @@ z.union([
       );
 
       zodExpr =
-          '''
-z.array(
+          '''z.array(
   z.union([
     z.date(),
     z.number(),
@@ -236,8 +267,7 @@ z.array(
     if (typeof val === 'number') return new Date(val);
     return val.toDate();
   })
-)
-'''
+)'''
               .trim();
     } else if (field.isList) {
       final item = _zodForType(
@@ -272,7 +302,9 @@ z.array(
     return _FieldResult(zodExpr, imports);
   }
 
-  // ───────── TYPE RESOLUTION ─────────
+  // ─────────────────────────────────────────────────────────────────────────────
+  // TYPE RESOLUTION
+  // ─────────────────────────────────────────────────────────────────────────────
 
   String _zodForType(
     String dartType,
@@ -299,9 +331,25 @@ z.array(
         imports.add(_Import.normal(rel, dartType));
       }
 
-      final isCyclic = cyclicTypes.contains(dartType);
+      // ── z.lazy() decision ──────────────────────────────────────────────────
+      //
+      // Enums are NEVER wrapped in z.lazy() — they are plain z.enum() constants
+      // with no module-load ordering concerns.
+      //
+      // For model schemas, we wrap in z.lazy() when [dartType] is in
+      // [cyclicTypes], which is the union of:
+      //   • intra-file cycles  (same-file self-reference)
+      //   • global cycles      (cross-file, e.g. EiUser ↔ PendingPayment)
+      //
+      // The global cycle set is computed by CrossFileRegistry.globalCyclicTypes()
+      // from the fieldDeps registered during the pre-scan phase in builder.dart.
+      // This means the decision is data-driven from actual field relationships,
+      // not heuristics, and covers arbitrarily deep cross-file cycles
+      // automatically for any model added in the future.
+      final needsLazy =
+          !_registry.isEnum(dartType) && cyclicTypes.contains(dartType);
 
-      if (isCyclic) {
+      if (needsLazy) {
         return 'z.lazy(() => ${dartType}Schema)';
       }
 
@@ -311,7 +359,9 @@ z.array(
     return 'z.unknown()';
   }
 
-  // ───────── IMPORT MERGE ─────────
+  // ─────────────────────────────────────────────────────────────────────────────
+  // IMPORT MERGE
+  // ─────────────────────────────────────────────────────────────────────────────
 
   void _mergeImports(
     Map<String, Set<String>> map,
@@ -330,7 +380,9 @@ z.array(
     }
   }
 
-  // ───────── GRAPH ─────────
+  // ─────────────────────────────────────────────────────────────────────────────
+  // DEPENDENCY GRAPH (intra-file)
+  // ─────────────────────────────────────────────────────────────────────────────
 
   Map<String, Set<String>> buildDependencyGraph(List<ClassInfo> classes) {
     final graph = <String, Set<String>>{};
@@ -342,6 +394,9 @@ z.array(
         if (_isValidType(f.dartType)) deps.add(f.dartType);
         if (f.listItemType != null && _isValidType(f.listItemType!)) {
           deps.add(f.listItemType!);
+        }
+        if (f.mapValueType != null && _isValidType(f.mapValueType!)) {
+          deps.add(f.mapValueType!);
         }
       }
 
@@ -357,13 +412,16 @@ z.array(
         _registry.resolve(type) != null;
   }
 
-  /// Wraps [name] in single quotes if it is not a valid bare JS identifier
-  /// (e.g. dotted names like 'driversLicense.licenceVerificationStatus').
+  // ─────────────────────────────────────────────────────────────────────────────
+  // GRAPH ALGORITHMS
+  // ─────────────────────────────────────────────────────────────────────────────
+
   String _tsKey(String name) {
-    const _identPattern = r'^[a-zA-Z_$][a-zA-Z0-9_$]*$';
-    return RegExp(_identPattern).hasMatch(name) ? name : "'$name'";
+    const identPattern = r'^[a-zA-Z_$][a-zA-Z0-9_$]*$';
+    return RegExp(identPattern).hasMatch(name) ? name : "'$name'";
   }
 
+  /// Kahn's algorithm — returns nodes in reverse dependency order.
   List<String> topoSort(Map<String, Set<String>> graph) {
     final inDegree = <String, int>{};
 
@@ -403,13 +461,20 @@ z.array(
     return result.reversed.toList();
   }
 
+  /// DFS cycle detection — returns every node in any cycle.
+  /// Marks the full cycle path, not just the back-edge target.
   Set<String> findCyclicTypes(Map<String, Set<String>> graph) {
     final visited = <String>{};
-    final stack = <String>{};
+    final stack = <String>[];
+    final stackSet = <String>{};
     final cyclic = <String>{};
 
     void dfs(String node) {
-      if (stack.contains(node)) {
+      if (stackSet.contains(node)) {
+        final cycleStart = stack.indexOf(node);
+        for (var i = cycleStart; i < stack.length; i++) {
+          cyclic.add(stack[i]);
+        }
         cyclic.add(node);
         return;
       }
@@ -417,21 +482,26 @@ z.array(
 
       visited.add(node);
       stack.add(node);
+      stackSet.add(node);
 
-      for (final n in graph[node] ?? {}) {
-        dfs(n);
-        if (cyclic.contains(n)) cyclic.add(node);
+      for (final neighbour in graph[node] ?? const <String>{}) {
+        dfs(neighbour);
       }
 
-      stack.remove(node);
+      stack.removeLast();
+      stackSet.remove(node);
     }
 
     for (final node in graph.keys) {
-      dfs(node);
+      if (!visited.contains(node)) dfs(node);
     }
 
     return cyclic;
   }
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // CONSTANTS
+  // ─────────────────────────────────────────────────────────────────────────────
 
   static const _primitives = {
     'String': 'z.string()',
@@ -466,7 +536,9 @@ z.array(
   }
 }
 
-// ───────── HELPERS ─────────
+// ─────────────────────────────────────────────────────────────────────────────
+// HELPERS
+// ─────────────────────────────────────────────────────────────────────────────
 
 class _Import {
   final String? path;
