@@ -228,7 +228,7 @@ class ZodGenerator {
     final imports = <_Import>{};
     String zodExpr;
 
-    // 🔥 DateTime converter
+    // DateTime converter
     if (field.hasDateTimeConverter || field.hasDateTimeNullableConverter) {
       imports.add(
         _Import.external(
@@ -240,15 +240,17 @@ class ZodGenerator {
           '''z.union([
   z.date(),
   z.number(),
+  z.string(),
   z.instanceof(Timestamp)
 ]).transform((val) => {
   if (val instanceof Date) return val;
   if (typeof val === 'number') return new Date(val);
+  if (typeof val === 'string') return new Date(val);
   return val.toDate();
 })'''
               .trim();
     }
-    // 🔥 DateTime list converter
+    // DateTime list converter
     else if (field.hasDateTimeListConverter) {
       imports.add(
         _Import.external(
@@ -261,10 +263,12 @@ class ZodGenerator {
   z.union([
     z.date(),
     z.number(),
+    z.string(),
     z.instanceof(Timestamp)
   ]).transform((val) => {
     if (val instanceof Date) return val;
     if (typeof val === 'number') return new Date(val);
+    if (typeof val === 'string') return new Date(val);
     return val.toDate();
   })
 )'''
