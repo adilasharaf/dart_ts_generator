@@ -31,8 +31,8 @@ import 'package:path/path.dart' as p;
 Builder tsIndexBuilder(BuilderOptions options) => _TsIndexBuilder(options);
 
 class _TsIndexBuilder implements Builder {
-  final BuilderOptions _options;
-  _TsIndexBuilder(this._options);
+  final BuilderOptions options;
+  _TsIndexBuilder(this.options);
 
   // FIX 1: Use $package$ (not $lib$) so build_runner allows outputs
   // outside lib/. The declared output gen/eimodels.g.ts sits at the

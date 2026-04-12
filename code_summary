@@ -1,13 +1,16 @@
-# 1. Generate the directory tree structure, ignoring specific paths
+# 1. Generate timestamp and write to file
+echo "Generated: $(date '+%Y-%m-%d %H:%M:%S %Z')" > code_summary.txt
+
+# 2. Generate the directory tree structure, ignoring specific paths
 find . -maxdepth 4 -not -path '*/.*' \
   -not -path '*/test/*' -not -path '*/example/*' \
   -not -path '*/bin/*' -not -path '*/node_modules/*' \
-  | sed 's/[^/]*\//  /g' > code_summary.txt
+  | sed 's/[^/]*\//  /g' >> code_summary.txt
 
-# 2. Append the header
+# 3. Append the header
 echo -e "\n--- FILE CONTENTS ---\n" >> code_summary.txt
 
-# 3. Find and cat the code files, ignoring the requested paths and locks/readmes
+# 4. Find and cat the code files, ignoring the requested paths and locks/readmes
 find . -type f \( -name "*.dart" -o -name "*.go" -o -name "*.ts" \) \
   -not -path "*/node_modules/*" \
   -not -path "*/test/*" \
@@ -19,4 +22,4 @@ find . -type f \( -name "*.dart" -o -name "*.go" -o -name "*.ts" \) \
   -exec cat {} \; \
   -exec echo -e "\n--- END FILE ---\n" \; >> code_summary.txt
 
-  mkdir -p docs && mv code_summary.txt docs/code_summary.txt
+mkdir -p docs && mv code_summary.txt docs/code_summary.txt

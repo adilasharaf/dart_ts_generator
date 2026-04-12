@@ -298,10 +298,14 @@ class ZodGenerator {
       );
     }
 
+    // ── Nullability + default ─────────────────────────────────────────────────
+    final def = _dartDefaultToTs(field.defaultValue);
+
     if (field.isNullable) zodExpr = '$zodExpr.nullish()';
 
-    final def = _dartDefaultToTs(field.defaultValue);
-    if (def != null) zodExpr = '$zodExpr.default($def)';
+    if (def != null) {
+      zodExpr = '$zodExpr.catch($def)';
+    }
 
     return _FieldResult(zodExpr, imports);
   }
@@ -336,20 +340,7 @@ class ZodGenerator {
       }
 
       // ── z.lazy() decision ──────────────────────────────────────────────────
-      //
-      // Enums are NEVER wrapped in z.lazy() — they are plain z.enum() constants
-      // with no module-load ordering concerns.
-      //
-      // For model schemas, we wrap in z.lazy() when [dartType] is in
-      // [cyclicTypes], which is the union of:
-      //   • intra-file cycles  (same-file self-reference)
-      //   • global cycles      (cross-file, e.g. EiUser ↔ PendingPayment)
-      //
-      // The global cycle set is computed by CrossFileRegistry.globalCyclicTypes()
-      // from the fieldDeps registered during the pre-scan phase in builder.dart.
-      // This means the decision is data-driven from actual field relationships,
-      // not heuristics, and covers arbitrarily deep cross-file cycles
-      // automatically for any model added in the future.
+      
       final needsLazy =
           !_registry.isEnum(dartType) && cyclicTypes.contains(dartType);
 
