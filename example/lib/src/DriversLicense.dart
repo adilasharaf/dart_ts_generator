@@ -1,4 +1,4 @@
-import 'package:dart_ts_generator_example/src/utils/JsonConverter.dart';
+import 'package:dart_ts_generator_example/EiModels.dart';
 import 'package:json_annotation/json_annotation.dart';
 
 part 'DriversLicense.g.dart';

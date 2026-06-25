@@ -15,10 +15,10 @@ class EiUser extends EiModel {
   String? gender;
   String? bloodGroup;
 
-  @PhoneConverter()
+  @NullablePhoneConverter()
   String? phone;
 
-  @DisplayNameConverter()
+  @NullableDisplayNameConverter()
   String? displayName;
 
   @JsonKey(defaultValue: 0.0)

@@ -65,6 +65,8 @@ class FieldInfo {
   final bool hasDisplayNameConverter;
   final bool hasDoubleConverter;
   final bool hasIntConverter;
+  final bool hasStringConverter;
+  final bool hasBoolConverter;
 
   /// From `@JsonKey(name: '...')`.
   final String? jsonKeyName;
@@ -98,6 +100,8 @@ class FieldInfo {
     this.hasDisplayNameConverter = false,
     this.hasDoubleConverter = false,
     this.hasIntConverter = false,
+    this.hasStringConverter = false,
+    this.hasBoolConverter = false,
     this.jsonKeyName,
     this.isIgnored = false,
     this.useSnakeCaseFallback = false,
@@ -315,15 +319,14 @@ class ModelAnalyzer {
       field,
       'DateTimeListConverter',
     );
-    final hasDateTimeNullableConv = _hasAnnotationNamed(
-      field,
-      'DateTimeNullableConverter',
-    );
+    final hasDateTimeNullableConv = _hasAnnotationNamed(field, 'DateTimeNullableConverter') || _hasAnnotationNamed(field, 'NullableDateTimeConverter');
     
-    final hasPhoneConv = _hasAnnotationNamed(field, 'PhoneConverter');
-    final hasDisplayNameConv = _hasAnnotationNamed(field, 'DisplayNameConverter');
-    final hasDoubleConv = _hasAnnotationNamed(field, 'DoubleConverter');
-    final hasIntConv = _hasAnnotationNamed(field, 'IntConverter');
+    final hasPhoneConv = _hasAnnotationNamed(field, 'PhoneConverter') || _hasAnnotationNamed(field, 'NullablePhoneConverter');
+    final hasDisplayNameConv = _hasAnnotationNamed(field, 'DisplayNameConverter') || _hasAnnotationNamed(field, 'NullableDisplayNameConverter');
+    final hasDoubleConv = _hasAnnotationNamed(field, 'DoubleConverter') || _hasAnnotationNamed(field, 'NullableDoubleConverter');
+    final hasIntConv = _hasAnnotationNamed(field, 'IntConverter') || _hasAnnotationNamed(field, 'NullableIntConverter');
+    final hasStringConv = _hasAnnotationNamed(field, 'StringConverter') || _hasAnnotationNamed(field, 'NullableStringConverter');
+    final hasBoolConv = _hasAnnotationNamed(field, 'BoolConverter') || _hasAnnotationNamed(field, 'NullableBoolConverter');
 
     // ── Collection detection ──────────────────────────────────────────────
     bool isList = false, isMap = false;
@@ -369,6 +372,8 @@ class ModelAnalyzer {
       hasDisplayNameConverter: hasDisplayNameConv,
       hasDoubleConverter: hasDoubleConv,
       hasIntConverter: hasIntConv,
+      hasStringConverter: hasStringConv,
+      hasBoolConverter: hasBoolConv,
       jsonKeyName: jsonKeyName,
       // Only apply snake_case fallback when there is no explicit @JsonKey(name:).
       // This ensures @JsonKey always wins, and snake_case only kicks in for

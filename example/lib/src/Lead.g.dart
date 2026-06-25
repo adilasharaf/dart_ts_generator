@@ -26,8 +26,10 @@ Lead _$LeadFromJson(Map<String, dynamic> json) => Lead()
       : Address.fromJson(json['currentLocation'] as Map<String, dynamic>)
   ..gender = json['gender'] as String?
   ..bloodGroup = json['bloodGroup'] as String?
-  ..phone = const PhoneConverter().fromJson(json['phone'])
-  ..displayName = const DisplayNameConverter().fromJson(json['displayName'])
+  ..phone = const NullablePhoneConverter().fromJson(json['phone'])
+  ..displayName = const NullableDisplayNameConverter().fromJson(
+    json['displayName'],
+  )
   ..pendingAmount = (json['pendingAmount'] as num?)?.toDouble() ?? 0.0
   ..deviceTokens =
       (json['deviceTokens'] as List<dynamic>?)
@@ -67,8 +69,10 @@ Map<String, dynamic> _$LeadToJson(Lead instance) => <String, dynamic>{
   'currentLocation': instance.currentLocation?.toJson(),
   'gender': instance.gender,
   'bloodGroup': instance.bloodGroup,
-  'phone': const PhoneConverter().toJson(instance.phone),
-  'displayName': const DisplayNameConverter().toJson(instance.displayName),
+  'phone': const NullablePhoneConverter().toJson(instance.phone),
+  'displayName': const NullableDisplayNameConverter().toJson(
+    instance.displayName,
+  ),
   'pendingAmount': instance.pendingAmount,
   'deviceTokens': instance.deviceTokens,
   'isDeleted': instance.isDeleted,

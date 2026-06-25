@@ -2,7 +2,13 @@ export 'src/enums/CallStatus.dart';
 export 'src/enums/CourseStatus.dart';
 
 export 'src/config/AppConfig.dart';
-export 'src/utils/JsonConverter.dart';
+export 'src/utils/DateTimeConverter.dart';
+export 'src/utils/PhoneConverter.dart';
+export 'src/utils/DisplayNameConverter.dart';
+export 'src/utils/DoubleConverter.dart';
+export 'src/utils/IntConverter.dart';
+export 'src/utils/StringConverter.dart';
+export 'src/utils/BoolConverter.dart';
 export 'src/config/AccountConfig.dart';
 export 'src/config/AuthConfig.dart';
 export 'src/enums/DLStatus.dart';
