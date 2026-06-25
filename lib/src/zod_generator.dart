@@ -293,6 +293,12 @@ class ZodGenerator {
   const num = Number(val);
   return isNaN(num) ? null : num;
 })'''.trim();
+    } else if (field.hasIntConverter) {
+      zodExpr = '''z.union([z.string(), z.number()]).nullish().transform((val) => {
+  if (val === null || val === undefined || val === "") return null;
+  const num = Number(val);
+  return isNaN(num) ? null : Math.trunc(num);
+})'''.trim();
     } else if (field.isList) {
       final item = _zodForType(
         field.listItemType ?? 'dynamic',

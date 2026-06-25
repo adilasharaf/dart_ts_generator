@@ -64,6 +64,7 @@ class FieldInfo {
   final bool hasPhoneConverter;
   final bool hasDisplayNameConverter;
   final bool hasDoubleConverter;
+  final bool hasIntConverter;
 
   /// From `@JsonKey(name: '...')`.
   final String? jsonKeyName;
@@ -96,6 +97,7 @@ class FieldInfo {
     this.hasPhoneConverter = false,
     this.hasDisplayNameConverter = false,
     this.hasDoubleConverter = false,
+    this.hasIntConverter = false,
     this.jsonKeyName,
     this.isIgnored = false,
     this.useSnakeCaseFallback = false,
@@ -321,6 +323,7 @@ class ModelAnalyzer {
     final hasPhoneConv = _hasAnnotationNamed(field, 'PhoneConverter');
     final hasDisplayNameConv = _hasAnnotationNamed(field, 'DisplayNameConverter');
     final hasDoubleConv = _hasAnnotationNamed(field, 'DoubleConverter');
+    final hasIntConv = _hasAnnotationNamed(field, 'IntConverter');
 
     // ── Collection detection ──────────────────────────────────────────────
     bool isList = false, isMap = false;
@@ -365,6 +368,7 @@ class ModelAnalyzer {
       hasPhoneConverter: hasPhoneConv,
       hasDisplayNameConverter: hasDisplayNameConv,
       hasDoubleConverter: hasDoubleConv,
+      hasIntConverter: hasIntConv,
       jsonKeyName: jsonKeyName,
       // Only apply snake_case fallback when there is no explicit @JsonKey(name:).
       // This ensures @JsonKey always wins, and snake_case only kicks in for
