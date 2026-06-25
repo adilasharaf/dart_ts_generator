@@ -9,13 +9,17 @@ part 'EiUser.g.dart';
 class EiUser extends EiModel {
   String? userId;
   String? email;
-  String? phone;
   String? photoUrl;
-  String? displayName;
   Address? address;
   Address? currentLocation;
   String? gender;
   String? bloodGroup;
+
+  @PhoneConverter()
+  String? phone;
+
+  @DisplayNameConverter()
+  String? displayName;
 
   @JsonKey(defaultValue: 0.0)
   @Deprecated("Use pendingPayments instead.")

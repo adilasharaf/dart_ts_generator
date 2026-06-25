@@ -55,3 +55,71 @@ class DateTimeListConverter
   List<Timestamp> toJson(List<DateTime> json) =>
       json.map((e) => Timestamp.fromDate(e)).toList();
 }
+
+class PhoneConverter implements JsonConverter<String?, dynamic> {
+  const PhoneConverter();
+
+  @override
+  String? fromJson(dynamic json) {
+    if (json == null) return null;
+    final phone = json.toString();
+    final digits = phone.replaceAll(RegExp(r'\D'), '');
+
+    if (digits.length == 10) {
+      return '+91$digits';
+    }
+
+    if (digits.length == 12 && digits.startsWith('91')) {
+      return '+$digits';
+    }
+
+    if (digits.length == 11 && digits.startsWith('0')) {
+      return '+91${digits.substring(1)}';
+    }
+
+    return null;
+  }
+
+  @override
+  dynamic toJson(String? object) => object;
+}
+
+class DisplayNameConverter implements JsonConverter<String?, dynamic> {
+  const DisplayNameConverter();
+
+  @override
+  String? fromJson(dynamic json) {
+    if (json == null) return null;
+    final name = json.toString();
+    if (name.trim().isEmpty) return null;
+    
+    return name
+        .trim()
+        .toLowerCase()
+        .split(RegExp(r'\s+'))
+        .map((word) {
+          if (word.isEmpty) return '';
+          return word[0].toUpperCase() + word.substring(1);
+        })
+        .join(' ');
+  }
+
+  @override
+  dynamic toJson(String? object) => object;
+}
+
+class DoubleConverter implements JsonConverter<double?, dynamic> {
+  const DoubleConverter();
+
+  @override
+  double? fromJson(dynamic json) {
+    if (json == null) return null;
+    if (json is double) return json;
+    if (json is int) return json.toDouble();
+    if (json is String) return double.tryParse(json);
+    return null;
+  }
+
+  @override
+  dynamic toJson(double? object) => object;
+}

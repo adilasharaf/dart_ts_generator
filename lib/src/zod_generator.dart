@@ -273,6 +273,26 @@ class ZodGenerator {
   })
 )'''
               .trim();
+    } else if (field.hasPhoneConverter) {
+      zodExpr = '''z.union([z.string(), z.number()]).nullish().transform((val) => {
+  if (!val) return null;
+  const phone = String(val).replace(/\\D/g, "");
+  if (phone.length === 10) return `+91\${phone}`;
+  if (phone.length === 12 && phone.startsWith("91")) return `+\${phone}`;
+  if (phone.length === 11 && phone.startsWith("0")) return `+91\${phone.slice(1)}`;
+  return null;
+})'''.trim();
+    } else if (field.hasDisplayNameConverter) {
+      zodExpr = '''z.string().nullish().transform((val) => {
+  if (!val || !val.trim()) return null;
+  return val.trim().toLowerCase().split(/\\s+/).map((word) => word.charAt(0).toUpperCase() + word.slice(1)).join(" ");
+})'''.trim();
+    } else if (field.hasDoubleConverter) {
+      zodExpr = '''z.union([z.string(), z.number()]).nullish().transform((val) => {
+  if (val === null || val === undefined || val === "") return null;
+  const num = Number(val);
+  return isNaN(num) ? null : num;
+})'''.trim();
     } else if (field.isList) {
       final item = _zodForType(
         field.listItemType ?? 'dynamic',

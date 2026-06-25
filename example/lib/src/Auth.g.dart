@@ -17,9 +17,7 @@ Auth _$AuthFromJson(Map<String, dynamic> json) => Auth()
   ..operationId = json['operationId'] as String?
   ..userId = json['userId'] as String?
   ..email = json['email'] as String?
-  ..phone = json['phone'] as String?
   ..photoUrl = json['photoUrl'] as String?
-  ..displayName = json['displayName'] as String?
   ..address = json['address'] == null
       ? null
       : Address.fromJson(json['address'] as Map<String, dynamic>)
@@ -28,6 +26,8 @@ Auth _$AuthFromJson(Map<String, dynamic> json) => Auth()
       : Address.fromJson(json['currentLocation'] as Map<String, dynamic>)
   ..gender = json['gender'] as String?
   ..bloodGroup = json['bloodGroup'] as String?
+  ..phone = const PhoneConverter().fromJson(json['phone'])
+  ..displayName = const DisplayNameConverter().fromJson(json['displayName'])
   ..pendingAmount = (json['pendingAmount'] as num?)?.toDouble() ?? 0.0
   ..deviceTokens =
       (json['deviceTokens'] as List<dynamic>?)
@@ -50,13 +50,13 @@ Map<String, dynamic> _$AuthToJson(Auth instance) => <String, dynamic>{
   'operationId': instance.operationId,
   'userId': instance.userId,
   'email': instance.email,
-  'phone': instance.phone,
   'photoUrl': instance.photoUrl,
-  'displayName': instance.displayName,
   'address': instance.address?.toJson(),
   'currentLocation': instance.currentLocation?.toJson(),
   'gender': instance.gender,
   'bloodGroup': instance.bloodGroup,
+  'phone': const PhoneConverter().toJson(instance.phone),
+  'displayName': const DisplayNameConverter().toJson(instance.displayName),
   'pendingAmount': instance.pendingAmount,
   'deviceTokens': instance.deviceTokens,
   'isDeleted': instance.isDeleted,
