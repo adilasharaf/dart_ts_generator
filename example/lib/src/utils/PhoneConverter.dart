@@ -21,6 +21,10 @@ class PhoneConverter implements JsonConverter<String, dynamic> {
       return '+91${digits.substring(1)}';
     }
 
+    if (digits.isNotEmpty) {
+      return '+$digits';
+    }
+
     return '';
   }
 
@@ -47,6 +51,10 @@ class NullablePhoneConverter implements JsonConverter<String?, dynamic> {
 
     if (digits.length == 11 && digits.startsWith('0')) {
       return '+91${digits.substring(1)}';
+    }
+
+    if (digits.isNotEmpty) {
+      return '+$digits';
     }
 
     return null;

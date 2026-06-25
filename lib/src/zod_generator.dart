@@ -306,61 +306,13 @@ class ZodGenerator {
 })'''.trim();
       }
     } else if (field.hasDoubleConverter) {
-      if (field.isNullable) {
-        zodExpr = '''z.union([z.string(), z.number()]).nullish().transform((val) => {
-  if (val === null || val === undefined || val === "") return null;
-  const num = Number(val);
-  return isNaN(num) ? null : num;
-})'''.trim();
-      } else {
-        zodExpr = '''z.union([z.string(), z.number()]).transform((val) => {
-  if (val === null || val === undefined || val === "") return 0;
-  const num = Number(val);
-  return isNaN(num) ? 0 : num;
-})'''.trim();
-      }
+      zodExpr = 'z.coerce.number()';
     } else if (field.hasIntConverter) {
-      if (field.isNullable) {
-        zodExpr = '''z.union([z.string(), z.number()]).nullish().transform((val) => {
-  if (val === null || val === undefined || val === "") return null;
-  const num = Number(val);
-  return isNaN(num) ? null : Math.trunc(num);
-})'''.trim();
-      } else {
-        zodExpr = '''z.union([z.string(), z.number()]).transform((val) => {
-  if (val === null || val === undefined || val === "") return 0;
-  const num = Number(val);
-  return isNaN(num) ? 0 : Math.trunc(num);
-})'''.trim();
-      }
+      zodExpr = 'z.coerce.number().int()';
     } else if (field.hasStringConverter) {
-      if (field.isNullable) {
-        zodExpr = '''z.union([z.string(), z.number(), z.boolean()]).nullish().transform((val) => {
-  if (val === null || val === undefined) return null;
-  return String(val);
-})'''.trim();
-      } else {
-        zodExpr = '''z.union([z.string(), z.number(), z.boolean()]).transform((val) => {
-  if (val === null || val === undefined) return "";
-  return String(val);
-})'''.trim();
-      }
+      zodExpr = 'z.coerce.string()';
     } else if (field.hasBoolConverter) {
-      if (field.isNullable) {
-        zodExpr = '''z.union([z.boolean(), z.string(), z.number()]).nullish().transform((val) => {
-  if (val === null || val === undefined || val === "") return null;
-  if (val === true || val === 1 || val === "true" || val === "1") return true;
-  if (val === false || val === 0 || val === "false" || val === "0") return false;
-  return null;
-})'''.trim();
-      } else {
-        zodExpr = '''z.union([z.boolean(), z.string(), z.number()]).transform((val) => {
-  if (val === null || val === undefined || val === "") return false;
-  if (val === true || val === 1 || val === "true" || val === "1") return true;
-  if (val === false || val === 0 || val === "false" || val === "0") return false;
-  return false;
-})'''.trim();
-      }
+      zodExpr = 'z.coerce.boolean()';
     } else if (field.isList) {
       final item = _zodForType(
         field.listItemType ?? 'dynamic',
