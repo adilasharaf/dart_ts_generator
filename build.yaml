@@ -1,4 +1,13 @@
 builders:
+  # ── Utils builder ─────────────────────────────────────────────────────────
+  # Generates the shared Zod transforms for dates, phones, etc.
+  ts_utils_builder:
+    import: "package:dart_ts_generator/utils_builder.dart"
+    builder_factories: ["tsUtilsBuilder"]
+    build_extensions: { "$package$": ["gen/utils/converters.g.ts"] }
+    auto_apply: root_package
+    build_to: source
+
   # ── Per-file builder ──────────────────────────────────────────────────────
   # Converts each lib/**/*.dart → gen/**/*.g.ts (root-level gen/, not lib/gen/)
   dart_ts_file_builder:

@@ -1,5 +1,7 @@
 // lib/src/zod_generator.dart
 
+import 'package:path/path.dart' as p;
+
 import 'model_analyzer.dart';
 import 'cross_file_registry.dart';
 
@@ -91,6 +93,7 @@ class ZodGenerator {
     }
 
     lines.add('');
+
     lines.add(bodyBlocks.join('\n\n'));
 
     return lines.join('\n');
@@ -196,22 +199,24 @@ class ZodGenerator {
     // A schema must be wrapped in z.lazy() when the type itself is cyclic
     // (self-referential or part of any intra- or cross-file cycle).
     final isCyclic = cyclicTypes.contains(cls.name);
+    final hasDotFields = cls.allFields.any((f) => f.effectiveJsonName.contains('.'));
 
-    final code = isCyclic
-        ? [
-            '// ── ${cls.name} (Schema) ──',
-            'export const $schemaName: z.ZodType<${cls.name}> = z.lazy(() =>',
-            '  z.object({',
-            ...fieldLines,
-            '  })',
-            ') as unknown as z.ZodType<${cls.name}>;',
-          ]
-        : [
-            '// ── ${cls.name} (Schema) ──',
-            'export const $schemaName: z.ZodType<${cls.name}> = z.object({',
-            ...fieldLines,
-            '});',
-          ];
+    var schemaExpr = 'z.object({\n${fieldLines.join('\n')}\n})';
+
+    if (hasDotFields) {
+      final importPath = _getConvertersImportPath(fromAssetPath);
+      imports.add(_Import.external("import { flattenObject } from '$importPath';"));
+      schemaExpr = 'z.preprocess((val: any) => flattenObject(val), $schemaExpr)';
+    }
+
+    if (isCyclic) {
+      schemaExpr = 'z.lazy(() => $schemaExpr) as unknown as z.ZodType<${cls.name}>';
+    }
+
+    final code = [
+      '// ── ${cls.name} (Schema) ──',
+      'export const $schemaName: z.ZodType<${cls.name}> = $schemaExpr;'
+    ];
 
     return _GeneratorResult(code: code.join('\n'), imports: imports);
   }
@@ -230,80 +235,32 @@ class ZodGenerator {
 
     // DateTime converter
     if (field.hasDateTimeConverter || field.hasDateTimeNullableConverter) {
-      imports.add(
-        _Import.external(
-          "import { Timestamp } from 'firebase-admin/firestore';",
-        ),
-      );
-
-      zodExpr =
-          '''z.union([
-  z.date(),
-  z.number(),
-  z.string(),
-  z.instanceof(Timestamp)
-]).transform((val) => {
-  if (val instanceof Date) return val;
-  if (typeof val === 'number') return new Date(val);
-  if (typeof val === 'string') return new Date(val);
-  return val.toDate();
-})'''
-              .trim();
+      final importPath = _getConvertersImportPath(fromAssetPath);
+      imports.add(_Import.external("import { dateTimeTransform } from '$importPath';"));
+      zodExpr = 'dateTimeTransform';
     }
     // DateTime list converter
     else if (field.hasDateTimeListConverter) {
-      imports.add(
-        _Import.external(
-          "import { Timestamp } from 'firebase-admin/firestore';",
-        ),
-      );
-
-      zodExpr =
-          '''z.array(
-  z.union([
-    z.date(),
-    z.number(),
-    z.string(),
-    z.instanceof(Timestamp)
-  ]).transform((val) => {
-    if (val instanceof Date) return val;
-    if (typeof val === 'number') return new Date(val);
-    if (typeof val === 'string') return new Date(val);
-    return val.toDate();
-  })
-)'''
-              .trim();
+      final importPath = _getConvertersImportPath(fromAssetPath);
+      imports.add(_Import.external("import { dateTimeTransform } from '$importPath';"));
+      zodExpr = 'z.array(dateTimeTransform)';
     } else if (field.hasPhoneConverter) {
+      final importPath = _getConvertersImportPath(fromAssetPath);
       if (field.isNullable) {
-        zodExpr = '''z.union([z.string(), z.number()]).nullish().transform((val) => {
-  if (!val) return null;
-  const phone = String(val).replace(/\\D/g, "");
-  if (phone.length === 10) return `+91\${phone}`;
-  if (phone.length === 12 && phone.startsWith("91")) return `+\${phone}`;
-  if (phone.length === 11 && phone.startsWith("0")) return `+91\${phone.slice(1)}`;
-  return null;
-})'''.trim();
+        imports.add(_Import.external("import { phoneTransformNullable } from '$importPath';"));
+        zodExpr = 'phoneTransformNullable';
       } else {
-        zodExpr = '''z.union([z.string(), z.number()]).transform((val) => {
-  if (!val) return "";
-  const phone = String(val).replace(/\\D/g, "");
-  if (phone.length === 10) return `+91\${phone}`;
-  if (phone.length === 12 && phone.startsWith("91")) return `+\${phone}`;
-  if (phone.length === 11 && phone.startsWith("0")) return `+91\${phone.slice(1)}`;
-  return "";
-})'''.trim();
+        imports.add(_Import.external("import { phoneTransform } from '$importPath';"));
+        zodExpr = 'phoneTransform';
       }
     } else if (field.hasDisplayNameConverter) {
+      final importPath = _getConvertersImportPath(fromAssetPath);
       if (field.isNullable) {
-        zodExpr = '''z.string().nullish().transform((val) => {
-  if (!val || !val.trim()) return null;
-  return val.trim().toLowerCase().split(/\\s+/).map((word) => word.charAt(0).toUpperCase() + word.slice(1)).join(" ");
-})'''.trim();
+        imports.add(_Import.external("import { displayNameTransformNullable } from '$importPath';"));
+        zodExpr = 'displayNameTransformNullable';
       } else {
-        zodExpr = '''z.string().transform((val) => {
-  if (!val || !val.trim()) return "";
-  return val.trim().toLowerCase().split(/\\s+/).map((word) => word.charAt(0).toUpperCase() + word.slice(1)).join(" ");
-})'''.trim();
+        imports.add(_Import.external("import { displayNameTransform } from '$importPath';"));
+        zodExpr = 'displayNameTransform';
       }
     } else if (field.hasDoubleConverter) {
       zodExpr = 'z.coerce.number()';
@@ -568,6 +525,18 @@ class ZodGenerator {
     if (value is String) return '"$value"';
     if (value is List) return '[]';
     return null;
+  }
+
+  String _getConvertersImportPath(String fromAssetPath) {
+    // Strip 'lib/' prefix and get directory
+    final normalized = fromAssetPath.replaceAll(r'\\', '/');
+    final withoutLib = normalized.startsWith('lib/') ? normalized.substring(4) : normalized;
+    final outDir = p.posix.dirname('gen/$withoutLib');
+    
+    // Target is 'gen/utils/converters.g' (no extension for TS import)
+    var rel = p.posix.relative('gen/utils/converters.g', from: outDir);
+    if (!rel.startsWith('.')) rel = './$rel';
+    return rel;
   }
 }
 
