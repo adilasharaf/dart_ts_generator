@@ -76,6 +76,6 @@ export const flattenObject = (obj: any, prefix = ""): any => {
 };
 ''';
 
-    await buildStep.writeAsString(outputId, content.trim() + '\\n');
+    await buildStep.writeAsString(outputId, content.trim() + '\n');
   }
 }
