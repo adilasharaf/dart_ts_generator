@@ -16,7 +16,7 @@ class _TsUtilsBuilder implements Builder {
   @override
   Future<void> build(BuildStep buildStep) async {
     final outputId = buildStep.allowedOutputs.single;
-    
+
     final content = '''
 // AUTO-GENERATED — DO NOT EDIT.
 import { z } from 'zod';
@@ -40,7 +40,7 @@ export const phoneTransform = z.union([z.string(), z.number()]).transform((val) 
   if (phone.length === 10) return `+91\${phone}`;
   if (phone.length === 12 && phone.startsWith("91")) return `+\${phone}`;
   if (phone.length === 11 && phone.startsWith("0")) return `+91\${phone.slice(1)}`;
-  return "";
+  return phone;
 });
 
 export const phoneTransformNullable = z.union([z.string(), z.number()]).nullish().transform((val) => {
@@ -49,7 +49,7 @@ export const phoneTransformNullable = z.union([z.string(), z.number()]).nullish(
   if (phone.length === 10) return `+91\${phone}`;
   if (phone.length === 12 && phone.startsWith("91")) return `+\${phone}`;
   if (phone.length === 11 && phone.startsWith("0")) return `+91\${phone.slice(1)}`;
-  return null;
+  return phone;
 });
 
 export const displayNameTransform = z.string().transform((val) => {
