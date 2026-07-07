@@ -60,6 +60,7 @@ class FieldInfo {
   final bool hasDateTimeListConverter;
 
   final bool hasDateTimeNullableConverter;
+  final bool hasAlgoliaDateTimeConverter;
 
   final bool hasPhoneConverter;
   final bool hasDisplayNameConverter;
@@ -95,6 +96,7 @@ class FieldInfo {
     this.defaultValue,
     this.hasDateTimeConverter = false,
     this.hasDateTimeNullableConverter = false,
+    this.hasAlgoliaDateTimeConverter = false,
     this.hasDateTimeListConverter = false,
     this.hasPhoneConverter = false,
     this.hasDisplayNameConverter = false,
@@ -320,6 +322,7 @@ class ModelAnalyzer {
       'DateTimeListConverter',
     );
     final hasDateTimeNullableConv = _hasAnnotationNamed(field, 'DateTimeNullableConverter') || _hasAnnotationNamed(field, 'NullableDateTimeConverter');
+    final hasAlgoliaDateTimeConv = _hasAnnotationNamed(field, 'AlgoliaDateTimeConverter') || _hasAnnotationNamed(field, 'AlgoliaDateTimeNullableConverter');
     
     final hasPhoneConv = _hasAnnotationNamed(field, 'PhoneConverter') || _hasAnnotationNamed(field, 'NullablePhoneConverter');
     final hasDisplayNameConv = _hasAnnotationNamed(field, 'DisplayNameConverter') || _hasAnnotationNamed(field, 'NullableDisplayNameConverter');
@@ -368,6 +371,7 @@ class ModelAnalyzer {
       hasDateTimeConverter: hasDateTimeConv,
       hasDateTimeListConverter: hasDateTimeListConv,
       hasDateTimeNullableConverter: hasDateTimeNullableConv,
+      hasAlgoliaDateTimeConverter: hasAlgoliaDateTimeConv,
       hasPhoneConverter: hasPhoneConv,
       hasDisplayNameConverter: hasDisplayNameConv,
       hasDoubleConverter: hasDoubleConv,

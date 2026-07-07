@@ -238,6 +238,8 @@ class ZodGenerator {
       final importPath = _getConvertersImportPath(fromAssetPath);
       imports.add(_Import.external("import { dateTimeTransform } from '$importPath';"));
       zodExpr = 'dateTimeTransform';
+    } else if (field.hasAlgoliaDateTimeConverter) {
+      zodExpr = 'z.coerce.number()';
     }
     // DateTime list converter
     else if (field.hasDateTimeListConverter) {
