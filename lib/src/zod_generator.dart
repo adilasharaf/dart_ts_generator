@@ -140,7 +140,9 @@ class ZodGenerator {
   String _tsTypeForField(FieldInfo field) {
     String base;
 
-    if (field.isList) {
+    if (field.hasAlgoliaDateTimeConverter) {
+      base = 'number';
+    } else if (field.isList) {
       base = '${_tsType(field.listItemType ?? 'any')}[]';
     } else if (field.isMap) {
       base = 'Record<string, ${_tsType(field.mapValueType ?? 'any')}>';
