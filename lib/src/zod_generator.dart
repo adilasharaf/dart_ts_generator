@@ -267,9 +267,9 @@ class ZodGenerator {
         zodExpr = 'displayNameTransform';
       }
     } else if (field.hasDoubleConverter) {
-      zodExpr = 'z.coerce.number()';
+      zodExpr = 'z.coerce.number().catch(0)';
     } else if (field.hasIntConverter) {
-      zodExpr = 'z.coerce.number().int()';
+      zodExpr = 'z.coerce.number().int().catch(0)';
     } else if (field.hasStringConverter) {
       zodExpr = 'z.coerce.string()';
     } else if (field.hasBoolConverter) {
